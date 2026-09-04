@@ -4,13 +4,15 @@ import os
 from dataclasses import dataclass
 from typing import Literal
 
-Product = Literal["spot", "usds_futures", "coin_futures", "options"]
+Product = Literal["spot", "usds_futures", "coin_futures", "options", "portfolio_margin"]
+TradingProduct = Literal["spot", "usds_futures", "coin_futures", "options"]
 
 BASE_URLS: dict[str, str] = {
     "spot": "https://api.binance.com",
     "usds_futures": "https://fapi.binance.com",
     "coin_futures": "https://dapi.binance.com",
     "options": "https://eapi.binance.com",
+    "portfolio_margin": "https://papi.binance.com",
 }
 
 ORDER_PATHS: dict[str, str] = {
