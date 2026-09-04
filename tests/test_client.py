@@ -1,6 +1,5 @@
 import hashlib
 import hmac
-from urllib.parse import parse_qs, urlsplit
 
 import httpx
 import pytest
@@ -10,7 +9,15 @@ from binance_mcp.config import BinanceConfig
 
 
 def cfg(**overrides):
-    values = dict(api_key="", api_secret="", private_key_path="", private_key_passphrase="", trading_enabled=False, timeout_seconds=5.0, recv_window_ms=5000)
+    values = dict(
+        api_key="",
+        api_secret="",
+        private_key_path="",
+        private_key_passphrase="",
+        trading_enabled=False,
+        timeout_seconds=5.0,
+        recv_window_ms=5000,
+    )
     values.update(overrides)
     return BinanceConfig(**values)
 
@@ -42,8 +49,20 @@ async def test_public_get_is_bound_to_binance_host():
 
 
 @pytest.mark.asyncio
+async def test_portfolio_margin_is_bound_to_papi_host():
+    async def handler(request: httpx.Request):
+        assert request.url.host == "papi.binance.com"
+        assert request.url.path == "/papi/v1/account"
+        return httpx.Response(200, json={"ok": True})
+
+    client = BinanceClient(cfg(), transport=httpx.MockTransport(handler))
+    assert await client.public_get("portfolio_margin", "/papi/v1/account") == {"ok": True}
+
+
+@pytest.mark.asyncio
 async def test_hmac_signature_covers_percent_encoded_payload(monkeypatch):
     seen = {}
+
     async def handler(request: httpx.Request):
         seen["request"] = request
         return httpx.Response(200, json={"ok": True})
