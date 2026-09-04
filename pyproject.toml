@@ -1,0 +1,23 @@
+[project]
+name = "binance-mcp"
+version = "0.1.0"
+description = "Secure MCP server for Binance public market data and authenticated account access"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "NsTut" }]
+dependencies = [
+  "cryptography>=43,<47",
+  "fastapi>=0.115,<1",
+  "httpx>=0.28,<1",
+  "mcp>=2,<3",
+  "pydantic>=2.9,<3",
+  "uvicorn[standard]>=0.32,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9", "pytest-asyncio>=0.24,<1"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
