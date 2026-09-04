@@ -4,9 +4,9 @@ A security-first Model Context Protocol server for Binance.
 
 It provides one compact surface instead of mirroring hundreds of Binance endpoints as individual MCP tools:
 
-- `binance_public_request` — GET any public Spot, USDⓈ-M Futures, COIN-M Futures, or Options REST path.
+- `binance_public_request` — GET any public Spot, USDⓈ-M Futures, COIN-M Futures, Options, or Portfolio Margin REST path.
 - `binance_account_request` — signed **GET-only** account access using credentials stored on the server.
-- `binance_order_request` — standard create/cancel order operations, disabled unless the deployment explicitly enables trading.
+- `binance_order_request` — standard create/cancel Spot, Futures, and Options order operations, disabled unless the deployment explicitly enables trading.
 - `binance_auth_status` — redacted capability status. It never returns secrets.
 
 The generic public request tool keeps pace with Binance adding new market-data endpoints without forcing a new MCP schema for every endpoint.
@@ -41,6 +41,9 @@ For account keys, prefer a dedicated Binance API key with only the permissions y
 | USDⓈ-M Futures | `https://fapi.binance.com` |
 | COIN-M Futures | `https://dapi.binance.com` |
 | Options | `https://eapi.binance.com` |
+| Portfolio Margin | `https://papi.binance.com` |
+
+Portfolio Margin reads use `product = portfolio_margin`. Its UM, CM, and margin order families use different paths, so they are deliberately not collapsed into the standard `binance_order_request` tool.
 
 Example public call:
 
