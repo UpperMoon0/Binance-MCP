@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+from urllib.parse import parse_qs
 
 import httpx
 import pytest
@@ -81,7 +82,73 @@ async def test_hmac_signature_covers_percent_encoded_payload(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_signed_boolean_serialization_is_lowercase():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["request"] = request
+        return httpx.Response(200, json={"ok": True})
+
+    client = BinanceClient(cfg(api_key="key", api_secret="secret"), transport=httpx.MockTransport(handler))
+    await client.signed_get("spot", "/api/v3/account", {"omitZeroBalances": True, "flag": False})
+    query = seen["request"].url.query.decode()
+    unsigned = query.rsplit("&signature=", 1)[0]
+    assert "omitZeroBalances=true" in unsigned
+    assert "flag=false" in unsigned
+    assert "True" not in unsigned
+    assert "False" not in unsigned
+
+
+@pytest.mark.asyncio
+async def test_flexible_earn_redemption_post_payload():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["request"] = request
+        return httpx.Response(200, json={"success": True})
+
+    client = BinanceClient(
+        cfg(api_key="key", api_secret="secret", trading_enabled=True),
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.simple_earn_redeem("USDT001", "700", "SPOT")
+    assert result == {"success": True}
+    request = seen["request"]
+    assert request.method == "POST"
+    assert request.url.path == "/sapi/v1/simple-earn/flexible/redeem"
+    query = parse_qs(request.url.query.decode())
+    assert query["productId"] == ["USDT001"]
+    assert query["amount"] == ["700"]
+    assert query["destAccount"] == ["SPOT"]
+
+
+@pytest.mark.asyncio
+async def test_dual_investment_subscribe_post_payload_defaults_none():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["request"] = request
+        return httpx.Response(200, json={"purchaseStatus": "PURCHASE_SUCCESS"})
+
+    client = BinanceClient(
+        cfg(api_key="key", api_secret="secret", trading_enabled=True),
+        transport=httpx.MockTransport(handler),
+    )
+    await client.dual_investment_subscribe("2650584", 51015871919, "700")
+    request = seen["request"]
+    assert request.method == "POST"
+    assert request.url.path == "/sapi/v1/dci/product/subscribe"
+    query = parse_qs(request.url.query.decode())
+    assert query["id"] == ["2650584"]
+    assert query["orderId"] == ["51015871919"]
+    assert query["depositAmount"] == ["700"]
+    assert query["autoCompoundPlan"] == ["NONE"]
+
+
+@pytest.mark.asyncio
 async def test_trading_disabled_by_default():
     client = BinanceClient(cfg(api_key="k", api_secret="s", trading_enabled=False))
     with pytest.raises(BinanceClientError, match="trading is disabled"):
         await client.order("spot", "/api/v3/order", "create", {"symbol": "BTCUSDT"})
+    with pytest.raises(BinanceClientError, match="trading is disabled"):
+        await client.simple_earn_redeem("USDT001", "1")
