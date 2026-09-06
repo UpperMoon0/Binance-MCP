@@ -1,5 +1,5 @@
 from fastapi import FastAPI
-from .oauth import MCPAuth, OAuthManager
+from .oauth_server import MCPAuth, OAuthManager
 from .server import build_mcp_asgi_app, client
 
 app = FastAPI(title="Binance MCP", docs_url=None, redoc_url=None)
