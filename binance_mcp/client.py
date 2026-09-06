@@ -16,8 +16,10 @@ from .config import BASE_URLS, BinanceConfig, Product
 
 Scalar = str | int | float | bool
 
+
 class BinanceClientError(RuntimeError):
     pass
+
 
 class BinanceClient:
     def __init__(self, config: BinanceConfig | None = None, transport: httpx.AsyncBaseTransport | None = None):
@@ -37,6 +39,20 @@ class BinanceClient:
             raise BinanceClientError("put query parameters in params, not in path")
         return parsed.path
 
+    @staticmethod
+    def _normalize_scalar(value: Scalar) -> str | int | float:
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        return value
+
+    @classmethod
+    def _normalize_params(cls, params: dict[str, Scalar]) -> dict[str, str | int | float]:
+        return {key: cls._normalize_scalar(value) for key, value in params.items()}
+
+    def _require_trading(self) -> None:
+        if not self.config.trading_enabled:
+            raise BinanceClientError("trading is disabled by deployment policy")
+
     def auth_status(self) -> dict[str, Any]:
         signer = "none"
         if self.config.private_key_path:
@@ -53,27 +69,56 @@ class BinanceClient:
 
     async def public_get(self, product: Product, path: str, params: dict[str, Scalar] | None = None) -> Any:
         url = BASE_URLS[product] + self._validate_path(path)
+        normalized = self._normalize_params(params or {})
         async with httpx.AsyncClient(timeout=self.config.timeout_seconds, transport=self._transport) as client:
-            response = await client.get(url, params=params or {})
+            response = await client.get(url, params=normalized)
         return self._decode(response)
 
     async def signed_get(self, product: Product, path: str, params: dict[str, Scalar] | None = None) -> Any:
         return await self._signed_request("GET", product, path, params or {})
 
     async def order(self, product: Product, path: str, action: str, params: dict[str, Scalar]) -> Any:
-        if not self.config.trading_enabled:
-            raise BinanceClientError("trading is disabled by deployment policy")
+        self._require_trading()
         method = {"create": "POST", "cancel": "DELETE"}.get(action)
         if not method:
             raise BinanceClientError("action must be create or cancel")
         return await self._signed_request(method, product, path, params)
+
+    async def simple_earn_redeem(self, product_id: str, amount: str, dest_account: str = "SPOT") -> Any:
+        self._require_trading()
+        return await self._signed_request(
+            "POST",
+            "spot",
+            "/sapi/v1/simple-earn/flexible/redeem",
+            {"productId": product_id, "amount": amount, "destAccount": dest_account},
+        )
+
+    async def dual_investment_subscribe(
+        self,
+        product_id: str,
+        order_id: int,
+        deposit_amount: str,
+        auto_compound_plan: str = "NONE",
+    ) -> Any:
+        self._require_trading()
+        return await self._signed_request(
+            "POST",
+            "spot",
+            "/sapi/v1/dci/product/subscribe",
+            {
+                "id": product_id,
+                "orderId": order_id,
+                "depositAmount": deposit_amount,
+                "autoCompoundPlan": auto_compound_plan,
+            },
+        )
 
     async def _signed_request(self, method: str, product: Product, path: str, params: dict[str, Scalar]) -> Any:
         if not self.config.api_key:
             raise BinanceClientError("BINANCE_API_KEY is not configured")
         if not (self.config.api_secret or self.config.private_key_path):
             raise BinanceClientError("no Binance signing credential is configured")
-        signed_params = dict(params)
+        signed_params = self._normalize_params(dict(params))
         signed_params.setdefault("recvWindow", self.config.recv_window_ms)
         signed_params.setdefault("timestamp", int(time.time() * 1000))
         payload = urlencode(signed_params, encoding="utf-8", safe="")
