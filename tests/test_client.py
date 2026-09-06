@@ -1,5 +1,6 @@
 import hashlib
 import hmac
+import logging
 from urllib.parse import parse_qs
 
 import httpx
@@ -36,6 +37,11 @@ def test_auth_status_is_redacted():
     assert "secret-key" not in repr(status)
     assert "secret-secret" not in repr(status)
     assert status["withdrawals_supported"] is False
+
+
+def test_http_transport_info_logging_is_suppressed():
+    assert logging.getLogger("httpx").level >= logging.WARNING
+    assert logging.getLogger("httpcore").level >= logging.WARNING
 
 
 @pytest.mark.asyncio

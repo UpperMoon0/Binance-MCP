@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import hmac
+import logging
 import time
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,12 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ed25519, padding, rsa
 
 from .config import BASE_URLS, BinanceConfig, Product
+
+# HTTPX's INFO request log includes the complete URL. Signed Binance endpoints
+# carry the signature in that URL, so never allow the transport logger to emit
+# those request lines. Errors are still surfaced through BinanceClientError.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 Scalar = str | int | float | bool
 
