@@ -115,6 +115,9 @@ class OAuthManager:
     def _routes(self) -> None:
         self.router.add_api_route("/.well-known/oauth-protected-resource", self.protected_metadata, methods=["GET"], response_model=None)
         self.router.add_api_route("/.well-known/oauth-protected-resource/mcp", self.protected_metadata, methods=["GET"], response_model=None)
+        # RFC 9728 path-derived discovery preserves the MCP resource path.
+        # ChatGPT may probe this exact URI when the configured server URL ends in /mcp/.
+        self.router.add_api_route("/.well-known/oauth-protected-resource/mcp/", self.protected_metadata, methods=["GET"], response_model=None)
         self.router.add_api_route("/.well-known/oauth-authorization-server", self.server_metadata, methods=["GET"], response_model=None)
         self.router.add_api_route("/oauth/register", self.register, methods=["POST"], response_model=None)
         self.router.add_api_route("/oauth/authorize", self.authorize_get, methods=["GET"], response_model=None)
@@ -122,7 +125,15 @@ class OAuthManager:
         self.router.add_api_route("/oauth/token", self.token, methods=["POST"], response_model=None)
 
     async def protected_metadata(self) -> JSONResponse:
-        return JSONResponse({"resource": self.config.resource, "authorization_servers": [self.config.issuer], "scopes_supported": sorted(SCOPES)}, headers={"Cache-Control": "no-store"})
+        return JSONResponse(
+            {
+                "resource": self.config.resource,
+                "authorization_servers": [self.config.issuer],
+                "bearer_methods_supported": ["header"],
+                "scopes_supported": sorted(SCOPES),
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def server_metadata(self) -> JSONResponse:
         i = self.config.issuer
@@ -136,6 +147,7 @@ class OAuthManager:
             "code_challenge_methods_supported": ["S256"],
             "token_endpoint_auth_methods_supported": ["none"],
             "scopes_supported": sorted(SCOPES),
+            "authorization_response_iss_parameter_supported": True,
         }, headers={"Cache-Control": "no-store"})
 
     async def register(self, request: Request) -> JSONResponse:
@@ -280,12 +292,13 @@ class OAuthManager:
             return True
 
     def unauthorized_response(self) -> tuple[int, list[tuple[bytes, bytes]], bytes]:
-        body = b'{"error":"unauthorized"}'
+        metadata = f"{self.config.issuer}/.well-known/oauth-protected-resource/mcp"
+        body = b'{"error":"invalid_token","error_description":"a valid OAuth access token is required"}'
         headers = [
             (b"content-type", b"application/json"),
             (b"content-length", str(len(body)).encode()),
             (b"cache-control", b"no-store"),
-            (b"www-authenticate", f'Bearer resource_metadata="{self.config.issuer}/.well-known/oauth-protected-resource"'.encode()),
+            (b"www-authenticate", f'Bearer resource_metadata="{metadata}", scope="mcp"'.encode()),
         ]
         return 401, headers, body
 
