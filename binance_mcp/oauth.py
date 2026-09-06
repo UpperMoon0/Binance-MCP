@@ -15,7 +15,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
@@ -164,7 +164,7 @@ class OAuthManager:
             return self._error(400, "invalid_client_metadata", "registration document too large")
         try:
             payload = json.loads(raw or b"{}")
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError):
             return self._error(400, "invalid_client_metadata", "invalid client registration document")
         if not isinstance(payload, dict):
             return self._error(400, "invalid_client_metadata", "invalid client registration document")
@@ -242,10 +242,10 @@ class OAuthManager:
             raise ValueError("response_type must be code")
         client_id = values.get("client_id", "").strip()
         redirect_uri = values.get("redirect_uri", "").strip()
-        challenge = values.get("code_challenge", "").strip()
-        if not client_id or not redirect_uri or not challenge:
+        code_challenge = values.get("code_challenge", "").strip()
+        if not client_id or not redirect_uri or not code_challenge:
             raise ValueError("client_id, redirect_uri, and code_challenge are required")
-        if values.get("code_challenge_method") != "S256" or not PKCE_CHALLENGE_RE.fullmatch(challenge):
+        if values.get("code_challenge_method") != "S256" or not PKCE_CHALLENGE_RE.fullmatch(code_challenge):
             raise ValueError("PKCE S256 is required")
         resource = values.get("resource", "").strip() or self.config.resource
         if resource != self.config.resource:
@@ -259,7 +259,7 @@ class OAuthManager:
         return {
             "client_id": client_id,
             "redirect_uri": redirect_uri,
-            "challenge": challenge,
+            "code_challenge": code_challenge,
             "scope": scope,
             "state": values.get("state", ""),
             "resource": resource,
@@ -292,24 +292,26 @@ class OAuthManager:
     async def authorize_post(self, request: Request):
         raw = (await request.body()).decode("utf-8")
         values = {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
-        if not _ct(values.pop("owner_token", ""), self.config.owner_token):
-            return self._error(403, "access_denied", "owner approval failed")
+        owner_token = values.pop("owner_token", "")
         try:
             auth = self._parse_auth(values)
         except ValueError as exc:
             return self._error(400, "invalid_request", str(exc))
+        if not _ct(owner_token, self.config.owner_token):
+            return self._error(403, "access_denied", "owner approval failed")
         code = _token(32)
         with self._lock:
             self.codes[_hash(code)] = {**auth, "expires": int(time.time()) + CODE_TTL}
             self._save()
-        params = {"code": code, "iss": self.config.issuer}
+        callback = urlparse(auth["redirect_uri"])
+        query = parse_qs(callback.query, keep_blank_values=True)
+        query["code"] = [code]
+        query["iss"] = [self.config.issuer]
         if auth["state"]:
-            params["state"] = auth["state"]
-        return RedirectResponse(
-            f"{auth['redirect_uri']}?{urlencode(params)}",
-            status_code=303,
-            headers={"Cache-Control": "no-store"},
-        )
+            query["state"] = [auth["state"]]
+        flattened = [(key, value) for key, values_ in query.items() for value in values_]
+        redirect_url = urlunparse(callback._replace(query=urlencode(flattened)))
+        return RedirectResponse(redirect_url, status_code=303, headers={"Cache-Control": "no-store"})
 
     async def token(self, request: Request):
         raw = (await request.body()).decode("utf-8")
@@ -376,7 +378,7 @@ class OAuthManager:
                 return self._error(400, "invalid_grant", "authorization code is invalid or expired")
             if client_id != record["client_id"] or redirect_uri != record["redirect_uri"]:
                 return self._error(400, "invalid_grant", "client or redirect mismatch")
-            if not _ct(_pkce(verifier), record["challenge"]):
+            if not _ct(_pkce(verifier), record["code_challenge"]):
                 return self._error(400, "invalid_grant", "PKCE verification failed")
             if resource != self.config.resource or resource != record["resource"]:
                 return self._error(400, "invalid_target", "resource does not match the authorized MCP server")
