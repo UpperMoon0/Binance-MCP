@@ -55,6 +55,9 @@ def authorize(client: TestClient, client_id: str) -> str:
     page = client.get("/oauth/authorize", params=params)
     assert page.status_code == 200, page.text
     assert "Authorize Binance MCP" in page.text
+    assert 'name="code_challenge"' in page.text
+    assert f'value="{CHALLENGE}"' in page.text
+    assert 'name="code_challenge_method" value="S256"' in page.text or "name='code_challenge_method' value='S256'" in page.text
 
     response = client.post(
         "/oauth/authorize",
