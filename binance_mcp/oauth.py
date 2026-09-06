@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import base64
+import binascii
 import hashlib
 import hmac
 import html
 import ipaddress
 import json
 import os
+import re
 import secrets
 import threading
 import time
@@ -19,8 +21,13 @@ from fastapi import APIRouter, Request
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 
 SCOPES = {"mcp", "offline_access"}
+AUTH_METHODS = {"none", "client_secret_basic", "client_secret_post"}
+GRANT_TYPES = {"authorization_code", "refresh_token"}
+RESPONSE_TYPES = {"code"}
 CODE_TTL = 300
 MAX_CLIENTS = 256
+PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
+PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
 
 
 def _token(n: int = 32) -> str:
@@ -115,8 +122,6 @@ class OAuthManager:
     def _routes(self) -> None:
         self.router.add_api_route("/.well-known/oauth-protected-resource", self.protected_metadata, methods=["GET"], response_model=None)
         self.router.add_api_route("/.well-known/oauth-protected-resource/mcp", self.protected_metadata, methods=["GET"], response_model=None)
-        # RFC 9728 path-derived discovery preserves the MCP resource path.
-        # ChatGPT may probe this exact URI when the configured server URL ends in /mcp/.
         self.router.add_api_route("/.well-known/oauth-protected-resource/mcp/", self.protected_metadata, methods=["GET"], response_model=None)
         self.router.add_api_route("/.well-known/oauth-authorization-server", self.server_metadata, methods=["GET"], response_model=None)
         self.router.add_api_route("/oauth/register", self.register, methods=["POST"], response_model=None)
@@ -137,18 +142,21 @@ class OAuthManager:
 
     async def server_metadata(self) -> JSONResponse:
         i = self.config.issuer
-        return JSONResponse({
-            "issuer": i,
-            "authorization_endpoint": f"{i}/oauth/authorize",
-            "token_endpoint": f"{i}/oauth/token",
-            "registration_endpoint": f"{i}/oauth/register",
-            "response_types_supported": ["code"],
-            "grant_types_supported": ["authorization_code", "refresh_token"],
-            "code_challenge_methods_supported": ["S256"],
-            "token_endpoint_auth_methods_supported": ["none"],
-            "scopes_supported": sorted(SCOPES),
-            "authorization_response_iss_parameter_supported": True,
-        }, headers={"Cache-Control": "no-store"})
+        return JSONResponse(
+            {
+                "issuer": i,
+                "authorization_endpoint": f"{i}/oauth/authorize",
+                "token_endpoint": f"{i}/oauth/token",
+                "registration_endpoint": f"{i}/oauth/register",
+                "response_types_supported": ["code"],
+                "grant_types_supported": ["authorization_code", "refresh_token"],
+                "code_challenge_methods_supported": ["S256"],
+                "token_endpoint_auth_methods_supported": sorted(AUTH_METHODS),
+                "scopes_supported": sorted(SCOPES),
+                "authorization_response_iss_parameter_supported": True,
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def register(self, request: Request) -> JSONResponse:
         raw = await request.body()
@@ -156,44 +164,106 @@ class OAuthManager:
             return self._error(400, "invalid_client_metadata", "registration document too large")
         try:
             payload = json.loads(raw or b"{}")
-            redirects = payload["redirect_uris"]
-            if not isinstance(redirects, list) or not 1 <= len(redirects) <= 10:
-                raise ValueError("one to ten redirect_uris are required")
-            redirects = [_secure_url(str(x), redirect=True) for x in redirects]
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            return self._error(400, "invalid_client_metadata", str(exc))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return self._error(400, "invalid_client_metadata", "invalid client registration document")
+        if not isinstance(payload, dict):
+            return self._error(400, "invalid_client_metadata", "invalid client registration document")
+
+        redirect_uris = payload.get("redirect_uris")
+        if not isinstance(redirect_uris, list) or not 1 <= len(redirect_uris) <= 10:
+            return self._error(400, "invalid_redirect_uri", "one to ten redirect_uris are required")
+        redirects: list[str] = []
+        try:
+            for raw_redirect in redirect_uris:
+                if not isinstance(raw_redirect, str):
+                    raise ValueError("redirect_uri must be a string")
+                redirect = _secure_url(raw_redirect, redirect=True)
+                if redirect not in redirects:
+                    redirects.append(redirect)
+        except ValueError as exc:
+            return self._error(400, "invalid_redirect_uri", str(exc))
+
+        grant_types = payload.get("grant_types") or []
+        response_types = payload.get("response_types") or []
+        if (
+            not isinstance(grant_types, list)
+            or not all(isinstance(value, str) for value in grant_types)
+            or not set(grant_types).issubset(GRANT_TYPES)
+        ):
+            return self._error(400, "invalid_client_metadata", "unsupported grant type")
+        if (
+            not isinstance(response_types, list)
+            or not all(isinstance(value, str) for value in response_types)
+            or not set(response_types).issubset(RESPONSE_TYPES)
+        ):
+            return self._error(400, "invalid_client_metadata", "unsupported response type")
+        application_type = str(payload.get("application_type") or "").strip()
+        if application_type not in {"", "web", "native"}:
+            return self._error(400, "invalid_client_metadata", "unsupported application_type")
+        auth_method = str(payload.get("token_endpoint_auth_method") or "none").strip()
+        if auth_method not in AUTH_METHODS:
+            return self._error(400, "invalid_client_metadata", "unsupported token_endpoint_auth_method")
+
         client_id = f"binance_{_token(24)}"
+        client_secret = _token(32) if auth_method != "none" else ""
         now = int(time.time())
+        client = {
+            "redirect_uris": redirects,
+            "name": str(payload.get("client_name") or "").strip()[:200],
+            "application_type": application_type,
+            "auth_method": auth_method,
+            "secret_hash": _hash(client_secret) if client_secret else "",
+            "created": now,
+            "last_used": now,
+        }
         with self._lock:
             self._cleanup()
             if len(self.clients) >= MAX_CLIENTS:
                 return self._error(503, "temporarily_unavailable", "client registration capacity reached")
-            self.clients[client_id] = {"redirect_uris": redirects, "name": str(payload.get("client_name", ""))[:200], "created": now}
+            self.clients[client_id] = client
             self._save()
-        return JSONResponse({
+
+        response: dict[str, Any] = {
             "client_id": client_id,
             "client_id_issued_at": now,
             "redirect_uris": redirects,
-            "token_endpoint_auth_method": "none",
+            "token_endpoint_auth_method": auth_method,
             "grant_types": ["authorization_code", "refresh_token"],
             "response_types": ["code"],
-        }, status_code=201, headers={"Cache-Control": "no-store"})
+            "client_name": client["name"],
+        }
+        if client_secret:
+            response["client_secret"] = client_secret
+            response["client_secret_expires_at"] = 0
+        return JSONResponse(response, status_code=201, headers={"Cache-Control": "no-store"})
 
     def _parse_auth(self, values: dict[str, str]) -> dict[str, str]:
         if values.get("response_type") != "code":
             raise ValueError("response_type must be code")
-        client_id = values.get("client_id", "")
-        redirect_uri = values.get("redirect_uri", "")
-        challenge = values.get("code_challenge", "")
-        if values.get("code_challenge_method") != "S256" or len(challenge) != 43:
+        client_id = values.get("client_id", "").strip()
+        redirect_uri = values.get("redirect_uri", "").strip()
+        challenge = values.get("code_challenge", "").strip()
+        if not client_id or not redirect_uri or not challenge:
+            raise ValueError("client_id, redirect_uri, and code_challenge are required")
+        if values.get("code_challenge_method") != "S256" or not PKCE_CHALLENGE_RE.fullmatch(challenge):
             raise ValueError("PKCE S256 is required")
-        resource = values.get("resource") or self.config.resource
+        resource = values.get("resource", "").strip() or self.config.resource
         if resource != self.config.resource:
             raise ValueError("invalid resource")
-        client = self.clients.get(client_id)
-        if not client or redirect_uri not in client["redirect_uris"]:
-            raise ValueError("unknown client or redirect_uri")
-        return {"client_id": client_id, "redirect_uri": redirect_uri, "challenge": challenge, "scope": _scope(values.get("scope", "")), "state": values.get("state", ""), "resource": resource}
+        scope = _scope(values.get("scope", ""))
+        with self._lock:
+            client = self.clients.get(client_id)
+            if not client or redirect_uri not in client["redirect_uris"]:
+                raise ValueError("unknown client or redirect_uri")
+            client["last_used"] = int(time.time())
+        return {
+            "client_id": client_id,
+            "redirect_uri": redirect_uri,
+            "challenge": challenge,
+            "scope": scope,
+            "state": values.get("state", ""),
+            "resource": resource,
+        }
 
     async def authorize_get(self, request: Request):
         try:
@@ -201,12 +271,23 @@ class OAuthManager:
             auth = self._parse_auth(values)
         except ValueError as exc:
             return self._error(400, "invalid_request", str(exc))
-        hidden = "".join(f'<input type="hidden" name="{html.escape(k)}" value="{html.escape(v, quote=True)}">' for k, v in auth.items())
+        hidden = "".join(
+            f'<input type="hidden" name="{html.escape(k)}" value="{html.escape(v, quote=True)}">'
+            for k, v in auth.items()
+        )
         action = f"{self.config.issuer}/oauth/authorize"
         body = f"""<!doctype html><html><head><meta charset='utf-8'><title>Authorize Binance MCP</title></head>
 <body><main><h1>Authorize Binance MCP</h1><p>Approve this MCP client to access the server. Binance API credentials stay server-side and are never issued to the client.</p>
-<form method='post' action='{html.escape(action, quote=True)}'>{hidden}<label>Owner approval token <input type='password' name='owner_token' autocomplete='current-password' required></label><button type='submit'>Authorize</button></form></main></body></html>"""
-        return HTMLResponse(body, headers={"Cache-Control": "no-store", "Content-Security-Policy": f"default-src 'none'; style-src 'unsafe-inline'; form-action {action}; frame-ancestors 'none'", "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer"})
+<form method='post' action='{html.escape(action, quote=True)}'>{hidden}<input type='hidden' name='response_type' value='code'><input type='hidden' name='code_challenge_method' value='S256'><label>Owner approval token <input type='password' name='owner_token' autocomplete='current-password' required></label><button type='submit'>Authorize</button></form></main></body></html>"""
+        return HTMLResponse(
+            body,
+            headers={
+                "Cache-Control": "no-store",
+                "Content-Security-Policy": f"default-src 'none'; style-src 'unsafe-inline'; form-action {action}; frame-ancestors 'none'",
+                "X-Frame-Options": "DENY",
+                "Referrer-Policy": "no-referrer",
+            },
+        )
 
     async def authorize_post(self, request: Request):
         raw = (await request.body()).decode("utf-8")
@@ -224,38 +305,95 @@ class OAuthManager:
         params = {"code": code, "iss": self.config.issuer}
         if auth["state"]:
             params["state"] = auth["state"]
-        return RedirectResponse(f"{auth['redirect_uri']}?{urlencode(params)}", status_code=302, headers={"Cache-Control": "no-store"})
+        return RedirectResponse(
+            f"{auth['redirect_uri']}?{urlencode(params)}",
+            status_code=303,
+            headers={"Cache-Control": "no-store"},
+        )
 
     async def token(self, request: Request):
         raw = (await request.body()).decode("utf-8")
         values = {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+        client_id, auth_error = self._authenticate_client(request, values)
+        if auth_error:
+            response = self._error(401, "invalid_client", auth_error)
+            response.headers["WWW-Authenticate"] = 'Basic realm="binance-mcp-oauth"'
+            return response
         grant = values.get("grant_type")
         if grant == "authorization_code":
-            return self._exchange_code(values)
+            return self._exchange_code(values, client_id)
         if grant == "refresh_token":
-            return self._exchange_refresh(values)
+            return self._exchange_refresh(values, client_id)
         return self._error(400, "unsupported_grant_type", "unsupported grant_type")
 
-    def _exchange_code(self, values: dict[str, str]) -> JSONResponse:
-        code = values.get("code", "")
-        verifier = values.get("code_verifier", "")
+    def _authenticate_client(self, request: Request, values: dict[str, str]) -> tuple[str, str | None]:
+        form_id = values.get("client_id", "").strip()
+        basic_id = ""
+        basic_secret = ""
+        has_basic = False
+        authorization = request.headers.get("authorization", "")
+        if authorization[:6].lower() == "basic ":
+            try:
+                decoded = base64.b64decode(authorization[6:], validate=True).decode("utf-8")
+                basic_id, basic_secret = decoded.split(":", 1)
+                has_basic = True
+            except (ValueError, UnicodeDecodeError, binascii.Error):
+                return "", "invalid HTTP Basic credentials"
+        client_id = basic_id if has_basic else form_id
+        if not client_id:
+            return "", "client_id is required"
+        with self._lock:
+            client = self.clients.get(client_id)
+            if not client:
+                return "", "unknown client"
+            auth_method = client.get("auth_method", "none")
+            if auth_method == "none":
+                if has_basic or values.get("client_secret", ""):
+                    return "", "public client must not send a client secret"
+            elif auth_method == "client_secret_basic":
+                if not has_basic or not _ct(_hash(basic_secret), client.get("secret_hash", "")):
+                    return "", "invalid client credentials"
+            elif auth_method == "client_secret_post":
+                if has_basic or not _ct(_hash(values.get("client_secret", "")), client.get("secret_hash", "")):
+                    return "", "invalid client credentials"
+            else:
+                return "", "unsupported client authentication method"
+            client["last_used"] = int(time.time())
+        return client_id, None
+
+    def _exchange_code(self, values: dict[str, str], client_id: str) -> JSONResponse:
+        code = values.get("code", "").strip()
+        redirect_uri = values.get("redirect_uri", "").strip()
+        verifier = values.get("code_verifier", "").strip()
+        resource = values.get("resource", "").strip()
+        if not code or not redirect_uri or not verifier or not resource:
+            return self._error(400, "invalid_request", "code, redirect_uri, code_verifier, and resource are required")
+        if not PKCE_VERIFIER_RE.fullmatch(verifier):
+            return self._error(400, "invalid_grant", "invalid PKCE code_verifier")
         with self._lock:
             record = self.codes.pop(_hash(code), None)
             if not record or record["expires"] < time.time():
                 return self._error(400, "invalid_grant", "authorization code is invalid or expired")
-            if values.get("client_id") != record["client_id"] or values.get("redirect_uri") != record["redirect_uri"]:
+            if client_id != record["client_id"] or redirect_uri != record["redirect_uri"]:
                 return self._error(400, "invalid_grant", "client or redirect mismatch")
-            if not verifier or not _ct(_pkce(verifier), record["challenge"]):
+            if not _ct(_pkce(verifier), record["challenge"]):
                 return self._error(400, "invalid_grant", "PKCE verification failed")
+            if resource != self.config.resource or resource != record["resource"]:
+                return self._error(400, "invalid_target", "resource does not match the authorized MCP server")
             response = self._issue(record["client_id"], record["scope"])
             self._save()
             return JSONResponse(response, headers={"Cache-Control": "no-store"})
 
-    def _exchange_refresh(self, values: dict[str, str]) -> JSONResponse:
-        presented = values.get("refresh_token", "")
+    def _exchange_refresh(self, values: dict[str, str], client_id: str) -> JSONResponse:
+        presented = values.get("refresh_token", "").strip()
+        if not presented:
+            return self._error(400, "invalid_request", "refresh_token is required")
+        resource = values.get("resource", "").strip()
+        if resource and resource != self.config.resource:
+            return self._error(400, "invalid_target", "resource does not match this MCP server")
         with self._lock:
             record = self.refresh.pop(_hash(presented), None)
-            if not record or record["expires"] < time.time() or values.get("client_id") != record["client_id"]:
+            if not record or record["expires"] < time.time() or client_id != record["client_id"]:
                 return self._error(400, "invalid_grant", "refresh token is invalid or expired")
             scope = _scope(values.get("scope", record["scope"]))
             if not set(scope.split()).issubset(set(record["scope"].split())):
@@ -270,7 +408,13 @@ class OAuthManager:
         refresh = _token(48)
         self.access[_hash(access)] = {"client_id": client_id, "scope": scope, "expires": now + self.config.access_ttl}
         self.refresh[_hash(refresh)] = {"client_id": client_id, "scope": scope, "expires": now + self.config.refresh_ttl}
-        return {"access_token": access, "token_type": "Bearer", "expires_in": self.config.access_ttl, "scope": scope, "refresh_token": refresh}
+        return {
+            "access_token": access,
+            "token_type": "Bearer",
+            "expires_in": self.config.access_ttl,
+            "scope": scope,
+            "refresh_token": refresh,
+        }
 
     def _cleanup(self) -> None:
         now = time.time()
@@ -304,7 +448,11 @@ class OAuthManager:
 
     @staticmethod
     def _error(status: int, code: str, description: str) -> JSONResponse:
-        return JSONResponse({"error": code, "error_description": description}, status_code=status, headers={"Cache-Control": "no-store"})
+        return JSONResponse(
+            {"error": code, "error_description": description},
+            status_code=status,
+            headers={"Cache-Control": "no-store"},
+        )
 
     def _load(self) -> None:
         path = Path(self.config.state_path)
@@ -327,7 +475,12 @@ class OAuthManager:
             path.parent.chmod(0o700)
         except OSError:
             pass
-        state = {"owner_fingerprint": _hash(self.config.owner_token), "clients": self.clients, "access": self.access, "refresh": self.refresh}
+        state = {
+            "owner_fingerprint": _hash(self.config.owner_token),
+            "clients": self.clients,
+            "access": self.access,
+            "refresh": self.refresh,
+        }
         tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
@@ -355,7 +508,16 @@ class MCPAuth:
             return
         if not self.oauth:
             body = b'{"error":"mcp_auth_not_configured"}'
-            await send({"type": "http.response.start", "status": 503, "headers": [(b"content-type", b"application/json"), (b"content-length", str(len(body)).encode())]})
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode()),
+                    ],
+                }
+            )
             await send({"type": "http.response.body", "body": body})
             return
         headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
