@@ -37,6 +37,7 @@ class FakeClient:
         self.spot_balances = ["0", "700"]
         self.spot_balance_calls = 0
         self.subscribe_calls = []
+        self.earn_subscribe_calls = []
         self.redeem_calls = []
 
     def _require_trading(self):
@@ -76,6 +77,11 @@ class FakeClient:
         self.spot_price_calls += 1
         return {"symbol": params["symbol"], "price": value}
 
+    async def simple_earn_subscribe(self, product_id, amount, auto_subscribe=True, source_account="SPOT"):
+        self._require_trading()
+        self.earn_subscribe_calls.append((product_id, amount, auto_subscribe, source_account))
+        return {"purchaseId": "p1", "success": True}
+
     async def simple_earn_redeem(self, product_id, amount, dest_account="SPOT"):
         self._require_trading()
         self.redeem_calls.append((product_id, amount, dest_account))
@@ -109,6 +115,28 @@ def matching_position(apr="0.2008"):
         "autoCompoundPlan": "NONE",
         "subscriptionTime": 1,
     }
+
+
+@pytest.mark.asyncio
+async def test_subscribe_flexible_validates_and_delegates():
+    client = FakeClient()
+    service = InvestmentService(client)
+    result = await service.subscribe_flexible("USD1001", "365.0000", True, "SPOT")
+    assert result == {
+        "productId": "USD1001",
+        "amount": "365",
+        "autoSubscribe": True,
+        "sourceAccount": "SPOT",
+        "response": {"purchaseId": "p1", "success": True},
+    }
+    assert client.earn_subscribe_calls == [("USD1001", "365", True, "SPOT")]
+
+
+@pytest.mark.asyncio
+async def test_subscribe_flexible_rejects_invalid_source_account():
+    service = InvestmentService(FakeClient())
+    with pytest.raises(BinanceClientError, match="sourceAccount must be SPOT, FUND, or ALL"):
+        await service.subscribe_flexible("USD1001", "1", True, "MARGIN")
 
 
 @pytest.mark.asyncio

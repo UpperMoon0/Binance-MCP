@@ -9,6 +9,7 @@ from .client import BinanceClient, BinanceClientError
 OptionType = Literal["PUT", "CALL"]
 AutoCompoundPlan = Literal["NONE", "STANDARD", "ADVANCED"]
 DestinationAccount = Literal["SPOT", "FUND"]
+SourceAccount = Literal["SPOT", "FUND", "ALL"]
 
 DUAL_PRODUCT_LIST_PATH = "/sapi/v1/dci/product/list"
 DUAL_POSITIONS_PATH = "/sapi/v1/dci/product/positions"
@@ -53,6 +54,31 @@ class InvestmentService:
             if str(row.get("productId", "")) == product_id:
                 return row
         raise BinanceClientError(f"Flexible Earn product {product_id} was not found in account positions")
+
+    async def subscribe_flexible(
+        self,
+        product_id: str,
+        amount: str,
+        auto_subscribe: bool = True,
+        source_account: SourceAccount = "SPOT",
+    ) -> dict[str, Any]:
+        self._require_trading()
+        parsed_amount = _decimal("amount", amount)
+        if source_account not in ("SPOT", "FUND", "ALL"):
+            raise BinanceClientError("sourceAccount must be SPOT, FUND, or ALL")
+        response = await self.client.simple_earn_subscribe(
+            product_id,
+            _string_decimal(parsed_amount),
+            auto_subscribe,
+            source_account,
+        )
+        return {
+            "productId": product_id,
+            "amount": _string_decimal(parsed_amount),
+            "autoSubscribe": auto_subscribe,
+            "sourceAccount": source_account,
+            "response": response,
+        }
 
     async def redeem_flexible(
         self,

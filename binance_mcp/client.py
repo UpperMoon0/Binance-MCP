@@ -91,6 +91,26 @@ class BinanceClient:
             raise BinanceClientError("action must be create or cancel")
         return await self._signed_request(method, product, path, params)
 
+    async def simple_earn_subscribe(
+        self,
+        product_id: str,
+        amount: str,
+        auto_subscribe: bool = True,
+        source_account: str = "SPOT",
+    ) -> Any:
+        self._require_trading()
+        return await self._signed_request(
+            "POST",
+            "spot",
+            "/sapi/v1/simple-earn/flexible/subscribe",
+            {
+                "productId": product_id,
+                "amount": amount,
+                "autoSubscribe": auto_subscribe,
+                "sourceAccount": source_account,
+            },
+        )
+
     async def simple_earn_redeem(self, product_id: str, amount: str, dest_account: str = "SPOT") -> Any:
         self._require_trading()
         return await self._signed_request(

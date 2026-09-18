@@ -7,6 +7,7 @@ It provides a compact surface instead of mirroring hundreds of Binance endpoints
 - `binance_public_request` — GET any public Spot, USDⓈ-M Futures, COIN-M Futures, Options, or Portfolio Margin REST path.
 - `binance_account_request` — signed **GET-only** account access using credentials stored on the server.
 - `binance_order_request` — standard create/cancel Spot, Futures, and Options order operations, disabled unless the deployment explicitly enables trading.
+- `binance_simple_earn_subscribe` — subscribe Spot/Funding funds into a specified Simple Earn Flexible product.
 - `binance_simple_earn_redeem` — redeem a specified Simple Earn Flexible amount to Spot or Funding.
 - `binance_dual_investment_subscribe` — subscribe Spot funds into one exact Dual Investment product after live product revalidation and optional quote guards.
 - `binance_dual_investment_positions` — read normalized Dual Investment positions.
@@ -73,6 +74,10 @@ params = {"omitZeroBalances":true}
 ## Financial write tools
 
 These actions can move funds. They all require `BINANCE_TRADING_ENABLED=true` and a Binance API key with the permissions required by Binance.
+
+### Subscribe Simple Earn Flexible
+
+`binance_simple_earn_subscribe` accepts a Flexible Earn `productId`, a positive decimal `amount`, optional `autoSubscribe` (default `true`), and optional `sourceAccount` (`SPOT`, `FUND`, or `ALL`; default `SPOT`).
 
 ### Redeem Simple Earn Flexible
 

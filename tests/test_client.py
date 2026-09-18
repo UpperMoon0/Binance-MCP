@@ -106,6 +106,30 @@ async def test_signed_boolean_serialization_is_lowercase():
 
 
 @pytest.mark.asyncio
+async def test_flexible_earn_subscription_post_payload():
+    seen = {}
+
+    async def handler(request: httpx.Request):
+        seen["request"] = request
+        return httpx.Response(200, json={"purchaseId": "p1", "success": True})
+
+    client = BinanceClient(
+        cfg(api_key="key", api_secret="secret", trading_enabled=True),
+        transport=httpx.MockTransport(handler),
+    )
+    result = await client.simple_earn_subscribe("USD1001", "365", True, "SPOT")
+    assert result == {"purchaseId": "p1", "success": True}
+    request = seen["request"]
+    assert request.method == "POST"
+    assert request.url.path == "/sapi/v1/simple-earn/flexible/subscribe"
+    query = parse_qs(request.url.query.decode())
+    assert query["productId"] == ["USD1001"]
+    assert query["amount"] == ["365"]
+    assert query["autoSubscribe"] == ["true"]
+    assert query["sourceAccount"] == ["SPOT"]
+
+
+@pytest.mark.asyncio
 async def test_flexible_earn_redemption_post_payload():
     seen = {}
 
@@ -158,3 +182,5 @@ async def test_trading_disabled_by_default():
         await client.order("spot", "/api/v3/order", "create", {"symbol": "BTCUSDT"})
     with pytest.raises(BinanceClientError, match="trading is disabled"):
         await client.simple_earn_redeem("USDT001", "1")
+    with pytest.raises(BinanceClientError, match="trading is disabled"):
+        await client.simple_earn_subscribe("USD1001", "1")

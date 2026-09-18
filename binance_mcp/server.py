@@ -10,7 +10,7 @@ from pydantic import Field
 
 from .client import BinanceClient, Scalar
 from .config import ORDER_PATHS, Product, TradingProduct
-from .investment import AutoCompoundPlan, DestinationAccount, InvestmentService, OptionType
+from .investment import AutoCompoundPlan, DestinationAccount, InvestmentService, OptionType, SourceAccount
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=True)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
@@ -79,6 +79,20 @@ async def binance_order_request(
     params: Annotated[dict[str, Scalar], Field(description="Order parameters required by Binance")],
 ) -> object:
     return await client.order(product, ORDER_PATHS[product], action, params)
+
+
+@server.tool(
+    title="Subscribe Simple Earn Flexible",
+    description="Subscribe funds from Spot, Funding, or both into one Simple Earn Flexible product. Financial write action; requires BINANCE_TRADING_ENABLED=true. Credentials and signatures stay server-side.",
+    annotations=WRITE,
+)
+async def binance_simple_earn_subscribe(
+    productId: Annotated[str, Field(description="Simple Earn Flexible product id, for example USD1001")],
+    amount: Annotated[str, Field(description="Positive decimal amount to subscribe")],
+    autoSubscribe: Annotated[bool, Field(description="Whether to enable automatic subscription for this product. Defaults to true.")] = True,
+    sourceAccount: Annotated[SourceAccount, Field(description="Source account: SPOT, FUND, or ALL. Defaults to SPOT.")] = "SPOT",
+) -> object:
+    return await investment.subscribe_flexible(productId, amount, autoSubscribe, sourceAccount)
 
 
 @server.tool(
