@@ -2,7 +2,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from .oauth_server import MCPAuth, OAuthManager
-from .server import build_mcp_asgi_app, client
+from .server import build_mcp_asgi_app, client, monitor
 
 mcp_app = build_mcp_asgi_app()
 
@@ -13,7 +13,12 @@ async def lifespan(_: FastAPI):
     # The MCP SDK initializes its Streamable HTTP task group in the child
     # app lifespan, so explicitly enter it from the parent FastAPI lifespan.
     async with mcp_app.router.lifespan_context(mcp_app):
-        yield
+        await monitor.start()
+        try:
+            yield
+        finally:
+            await monitor.stop()
+            await client.close()
 
 
 app = FastAPI(title="Binance MCP", docs_url=None, redoc_url=None, lifespan=lifespan)
@@ -29,6 +34,9 @@ async def health() -> dict:
         "mcp_auth_mode": "oauth" if oauth else "unconfigured",
         "binance_account_access_ready": status["account_access_ready"],
         "binance_trading_enabled": status["trading_enabled"],
+        "execution": {"monitor_at": monitor.execution.ledger.meta("monitorAt"),
+                      "stream_connected": monitor.execution.ledger.meta("streamConnected"),
+                      "pause_reason": monitor.execution.ledger.meta("pause")},
     }
 
 app.mount("/mcp", MCPAuth(mcp_app, oauth))

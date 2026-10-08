@@ -184,3 +184,60 @@ async def test_trading_disabled_by_default():
         await client.simple_earn_redeem("USDT001", "1")
     with pytest.raises(BinanceClientError, match="trading is disabled"):
         await client.simple_earn_subscribe("USD1001", "1")
+
+@pytest.mark.asyncio
+async def test_connection_reuse_close_and_rate_limit_cooldown():
+    calls = []
+    async def handler(request):
+        calls.append(request)
+        if len(calls) == 3:
+            return httpx.Response(429, headers={"Retry-After": "120", "X-MBX-USED-WEIGHT-1M": "6000"}, json={"code": -1003})
+        return httpx.Response(200, json={"price": "1"})
+    client = BinanceClient(cfg(), transport=httpx.MockTransport(handler))
+    await client.public_get("spot", "/api/v3/ticker/price")
+    session = client._http
+    await client.public_get("spot", "/api/v3/ticker/price")
+    assert client._http is session
+    with pytest.raises(BinanceClientError) as exc:
+        await client.public_get("spot", "/api/v3/ticker/price")
+    assert exc.value.metadata()["retryAfter"] == 120
+    assert exc.value.metadata()["rateLimitHeaders"]["x-mbx-used-weight-1m"] == "6000"
+    with pytest.raises(BinanceClientError, match="cooldown"):
+        await client.public_get("spot", "/api/v3/ticker/price")
+    assert len(calls) == 3
+    await client.close()
+    assert session.is_closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,code", [(504, -1007), (500, -1000), (400, -1006), (409, -2021)])
+async def test_structured_unknown_errors_do_not_leak_signed_urls(status, code):
+    async def handler(request):
+        return httpx.Response(status, json={"code": code, "msg": str(request.url)})
+    client = BinanceClient(cfg(api_key="credential-key", api_secret="credential-secret", trading_enabled=True),
+                           transport=httpx.MockTransport(handler))
+    with pytest.raises(BinanceClientError) as exc:
+        await client.order("spot", "/api/v3/order", "create", {"symbol": "BTCUSDT"})
+    assert exc.value.outcome_unknown
+    assert exc.value.status == status
+    assert exc.value.code == code
+    assert "signature" not in str(exc.value)
+    assert "credential" not in str(exc.value)
+    await client.close()
+
+
+@pytest.mark.asyncio
+async def test_server_clock_offset_is_applied_without_retrying_writes(monkeypatch):
+    monkeypatch.setattr("time.time", lambda: 1700000000.0)
+    calls = []
+    async def handler(request):
+        calls.append(request)
+        if request.url.path == "/api/v3/time":
+            return httpx.Response(200, json={"serverTime": 1700000002000})
+        assert parse_qs(request.url.query.decode())["timestamp"] == ["1700000002000"]
+        return httpx.Response(200, json={"ok": True})
+    client = BinanceClient(cfg(api_key="k", api_secret="s", trading_enabled=True), transport=httpx.MockTransport(handler))
+    assert await client.sync_time() == 2000
+    await client.order("spot", "/api/v3/order", "create", {})
+    assert len(calls) == 2
+    await client.close()

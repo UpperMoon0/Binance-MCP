@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import time
 from typing import Annotated, Literal
 
 from mcp.server import MCPServer
@@ -9,19 +11,26 @@ from mcp.types import ToolAnnotations
 from pydantic import Field
 
 from .client import BinanceClient, Scalar
-from .config import ORDER_PATHS, Product, TradingProduct
-from .investment import AutoCompoundPlan, DestinationAccount, InvestmentService, OptionType, SourceAccount
+from .config import Product
+from .execution import ExecutionService
+from .ledger import Ledger
+from .monitor import Monitor
+from .investment import InvestmentService, OptionType
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=True)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
 
 client = BinanceClient()
 investment = InvestmentService(client)
+ledger = Ledger(os.getenv("BINANCE_LEDGER_PATH", "data/strategy.sqlite"),
+                json.loads(os.getenv("BINANCE_STRATEGIES", "{}")))
+execution = ExecutionService(client, ledger, [s.strip() for s in os.getenv("BINANCE_APPROVED_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()])
+monitor = Monitor(execution, float(os.getenv("BINANCE_MONITOR_INTERVAL_SECONDS", "30")))
 server = MCPServer(
     "Binance MCP",
     instructions=(
         "Use binance_public_request for public Binance REST data and binance_account_request for read-only signed account endpoints. "
-        "Use the named Simple Earn and Dual Investment tools for those financial writes; do not request arbitrary signed POSTs. "
+        "Every write requires a deployment-provisioned strategyId and stable intentId. Use protected OTOCO for entries, owned OCO for exits, and named investment tools; never request arbitrary signed POSTs. Repeated intents reconcile without re-submitting. "
         "Trading is separately deployment-gated. Never request or reveal Binance secrets in chat. Withdrawals are intentionally unsupported."
     ),
 )
@@ -70,42 +79,55 @@ async def binance_account_request(
 
 @server.tool(
     title="Binance order mutation",
-    description="Create or cancel a standard Spot/Futures/Options order. Requires BINANCE_TRADING_ENABLED=true and a trade-enabled API key. Portfolio Margin uses multiple distinct order families and is intentionally not routed through this generic order tool. Withdrawals are not supported.",
+    description="Create a strategy-owned Spot LIMIT SELL or cancel a recorded intent using targetIntentId. BUY entries use binance_strategy_execution with otoco. Requires BINANCE_TRADING_ENABLED=true and a trade-enabled API key. Portfolio Margin uses multiple distinct order families and is intentionally not routed through this generic order tool. Withdrawals are not supported.",
     annotations=WRITE,
 )
 async def binance_order_request(
-    product: Annotated[TradingProduct, Field(description="spot, usds_futures, coin_futures, or options")],
+    product: Annotated[Literal["spot"], Field(description="Managed Spot trading only")],
     action: Annotated[Literal["create", "cancel"], Field(description="Order action")],
     params: Annotated[dict[str, Scalar], Field(description="Order parameters required by Binance")],
+    *,
+    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
-    return await client.order(product, ORDER_PATHS[product], action, params)
+    if product != "spot":
+        raise ValueError("managed allocation supports Spot only; derivatives writes are disabled")
+    return await execution.execute(strategyId, intentId, "order" if action == "create" else "cancel", params)
 
 
 @server.tool(
     title="Subscribe Simple Earn Flexible",
-    description="Subscribe funds from Spot, Funding, or both into one Simple Earn Flexible product. Financial write action; requires BINANCE_TRADING_ENABLED=true. Credentials and signatures stay server-side.",
+    description="Subscribe strategy-owned Spot funds into one Simple Earn Flexible product with automatic subscription disabled. Financial write action; requires BINANCE_TRADING_ENABLED=true. Credentials and signatures stay server-side.",
     annotations=WRITE,
 )
 async def binance_simple_earn_subscribe(
     productId: Annotated[str, Field(description="Simple Earn Flexible product id, for example USD1001")],
     amount: Annotated[str, Field(description="Positive decimal amount to subscribe")],
-    autoSubscribe: Annotated[bool, Field(description="Whether to enable automatic subscription for this product. Defaults to true.")] = True,
-    sourceAccount: Annotated[SourceAccount, Field(description="Source account: SPOT, FUND, or ALL. Defaults to SPOT.")] = "SPOT",
+    autoSubscribe: Annotated[bool, Field(description="Whether to enable automatic subscription for this product. Defaults to false.")] = False,
+    sourceAccount: Annotated[Literal["SPOT"], Field(description="Managed source is SPOT only")] = "SPOT",
+    *,
+    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
-    return await investment.subscribe_flexible(productId, amount, autoSubscribe, sourceAccount)
+    return await execution.execute(strategyId, intentId, "earn_subscribe", {
+        "productId": productId, "amount": amount, "autoSubscribe": autoSubscribe, "sourceAccount": sourceAccount})
 
 
 @server.tool(
     title="Redeem Simple Earn Flexible",
-    description="Redeem a specific Simple Earn Flexible amount to Spot or Funding. Financial write action; requires BINANCE_TRADING_ENABLED=true. Credentials and signatures stay server-side.",
+    description="Redeem a strategy-owned Simple Earn Flexible amount to Spot. Financial write action; requires BINANCE_TRADING_ENABLED=true. Credentials and signatures stay server-side.",
     annotations=WRITE,
 )
 async def binance_simple_earn_redeem(
     productId: Annotated[str, Field(description="Simple Earn Flexible product id, for example USDT001")],
     amount: Annotated[str, Field(description="Positive decimal amount to redeem")],
-    destAccount: Annotated[DestinationAccount, Field(description="Destination account. Defaults to SPOT.")] = "SPOT",
+    destAccount: Annotated[Literal["SPOT"], Field(description="Managed destination is SPOT only")] = "SPOT",
+    *,
+    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
-    return await investment.redeem_flexible(productId, amount, destAccount)
+    return await execution.execute(strategyId, intentId, "earn_redeem", {
+        "productId": productId, "amount": amount, "destAccount": destAccount})
 
 
 @server.tool(
@@ -119,23 +141,21 @@ async def binance_dual_investment_subscribe(
     exercisedCoin: Annotated[str, Field(description="Target exercised asset, e.g. BTC for Buy Low BTC")],
     optionType: Annotated[OptionType, Field(description="PUT for Buy Low or CALL for Sell High")],
     depositAmount: Annotated[str, Field(description="Positive decimal subscription amount")],
-    autoCompoundPlan: Annotated[AutoCompoundPlan, Field(description="NONE, STANDARD, or ADVANCED. Defaults to NONE.")] = "NONE",
+    autoCompoundPlan: Annotated[Literal["NONE"], Field(description="Managed workflows disable auto compounding")] = "NONE",
     minimumApr: Annotated[str | None, Field(description="Optional decimal APR floor, e.g. 0.18 for 18%")] = None,
     minimumStrikeDistancePercent: Annotated[
         str | None,
         Field(description="Optional minimum live strike distance percentage, e.g. 2.0"),
     ] = None,
+    *,
+    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
-    return await investment.subscribe_dual(
-        product_id=productId,
-        option_type=optionType,
-        exercised_coin=exercisedCoin,
-        invest_coin=investCoin,
-        deposit_amount=depositAmount,
-        auto_compound_plan=autoCompoundPlan,
-        minimum_apr=minimumApr,
-        minimum_strike_distance_percent=minimumStrikeDistancePercent,
-    )
+    return await execution.execute(strategyId, intentId, "dual_subscribe", {
+        "dualProductId": productId, "optionType": optionType, "exercisedCoin": exercisedCoin,
+        "investCoin": investCoin, "amount": depositAmount, "autoCompoundPlan": autoCompoundPlan,
+        "minimumApr": minimumApr, "minimumStrikeDistancePercent": minimumStrikeDistancePercent})
+
 
 
 @server.tool(
@@ -172,20 +192,17 @@ async def binance_dual_investment_from_flexible_earn(
         str | None,
         Field(description="Optional minimum live strike distance percentage"),
     ] = None,
-    autoCompoundPlan: Annotated[AutoCompoundPlan, Field(description="Defaults to NONE; never silently enables compounding")] = "NONE",
+    autoCompoundPlan: Annotated[Literal["NONE"], Field(description="Managed workflows disable auto compounding")] = "NONE",
+    *,
+    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
-    return await investment.from_flexible_earn(
-        earn_product_id=earnProductId,
-        dual_product_id=dualProductId,
-        option_type=optionType,
-        exercised_coin=exercisedCoin,
-        invest_coin=investCoin,
-        amount=amount,
-        preserve_earn_amount=preserveEarnAmount,
-        minimum_apr=minimumApr,
-        minimum_strike_distance_percent=minimumStrikeDistancePercent,
-        auto_compound_plan=autoCompoundPlan,
-    )
+    return await execution.execute(strategyId, intentId, "earn_to_dual", {
+        "earnProductId": earnProductId, "dualProductId": dualProductId, "optionType": optionType,
+        "exercisedCoin": exercisedCoin, "investCoin": investCoin, "amount": amount,
+        "preserveEarnAmount": preserveEarnAmount, "autoCompoundPlan": autoCompoundPlan,
+        "minimumApr": minimumApr, "minimumStrikeDistancePercent": minimumStrikeDistancePercent})
+
 
 
 @server.tool(
@@ -195,6 +212,59 @@ async def binance_dual_investment_from_flexible_earn(
 )
 async def binance_auth_status() -> dict:
     return client.auth_status()
+
+
+@server.tool(title="Strategy trade preview", annotations=READ_ONLY,
+             description="Validate protected Spot entry/exit against live filters, fees, spread, account permissions and strategy capital. Execution revalidates.")
+async def binance_trade_preview(strategyId: str, operation: Literal["order", "oco", "otoco"], params: dict[str, Scalar]) -> dict:
+    return await execution.preview(strategyId, operation, params)
+
+
+@server.tool(title="Strategy execution", annotations=WRITE,
+             description="Persistent budgeted workflow: OTOCO limit BUY with fee-adjusted exits, owned SELL OCO, limit SELL, or linked cancellation. Never retries uncertain writes. Params for entry: symbol, quantity, price, takeProfit, stopPrice. Cancel: targetIntentId.")
+async def binance_strategy_execution(strategyId: str, intentId: str,
+                                     operation: Literal["order", "oco", "otoco", "cancel"], params: dict[str, Scalar]) -> dict:
+    return await execution.execute(strategyId, intentId, operation, params)
+
+
+@server.tool(title="Execution reconciliation", annotations=READ_ONLY,
+             description="Query original intent and exchange history without resubmitting. Updates local journal/accounting only.")
+async def binance_execution_status(intentId: str) -> dict:
+    async with execution.lock:
+        try:
+            return await execution.reconcile(intentId)
+        except Exception:
+            ledger.pause("reconciliation incomplete for " + intentId)
+            raise
+
+
+@server.tool(title="Unified portfolio snapshot", annotations=READ_ONLY,
+             description="Spot, Flexible Earn, Dual Investment, orders, linked lists and shared reservations with observation times and explicit missing coverage. LD receipt assets are excluded from underlying totals.")
+async def binance_portfolio_snapshot() -> dict:
+    return await execution.snapshots.portfolio()
+
+
+@server.tool(title="Bounded market scan", annotations=READ_ONLY,
+             description="Approved universe, up to 20 symbols: closed candle structure, volume, volatility, spread and raw observations. Depth fetched only for at most five shortlisted symbols. No news scraping or executable research instructions.")
+async def binance_market_scan(symbols: list[str], shortlist: list[str] | None = None) -> dict:
+    return await execution.snapshots.market(symbols, shortlist)
+
+
+@server.tool(title="Strategy accounting and monitor status", annotations=READ_ONLY,
+             description="Owned capital, reservations, categorized realized results/commissions, unrealized quote valuation, paper state and operational monitor freshness.")
+async def binance_strategy_status(strategyId: str) -> dict:
+    cfg = ledger.strategy(strategyId)
+    assets = {r[0] for r in ledger.db.execute("SELECT asset FROM balances WHERE strategy=? AND asset!=?", (strategyId, cfg["quote"]))}
+    prices = {}
+    for asset in assets:
+        try:
+            response = await client.public_get("spot", "/api/v3/ticker/price", {"symbol": asset + cfg["quote"]})
+            prices[asset] = response["price"]
+        except Exception:
+            pass
+    return {**ledger.report(strategyId, prices), "observedAt": int(time.time() * 1000),
+            "monitorAt": ledger.meta("monitorAt"), "streamConnected": ledger.meta("streamConnected"),
+            "lastUserEventAt": ledger.meta("lastUserEventAt")}
 
 
 def build_mcp_asgi_app():
