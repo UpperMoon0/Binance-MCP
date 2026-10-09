@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from .client import BinanceClient, BinanceClientError
+from .pagination import Coverage
 
 OptionType = Literal["PUT", "CALL"]
 AutoCompoundPlan = Literal["NONE", "STANDARD", "ADVANCED"]
@@ -39,20 +40,22 @@ def _string_decimal(value: Decimal) -> str:
 class InvestmentService:
     def __init__(self, client: BinanceClient):
         self.client = client
+        self.checkpoint = lambda phase, data: None
 
     def _require_trading(self) -> None:
         self.client._require_trading()
 
     async def flexible_position(self, product_id: str) -> dict[str, Any]:
-        response = await self.client.signed_get(
-            "spot",
-            FLEXIBLE_POSITION_PATH,
-            {"productId": product_id, "size": 100},
-        )
-        rows = response.get("rows", []) if isinstance(response, dict) else []
-        for row in rows:
-            if str(row.get("productId", "")) == product_id:
-                return row
+        for page in range(1, 101):
+            response = await self.client.signed_get(
+                "spot", FLEXIBLE_POSITION_PATH, {"productId": product_id, "size": 100, "current": page},
+            )
+            rows = response.get("rows", []) if isinstance(response, dict) else []
+            for row in rows:
+                if str(row.get("productId", "")) == product_id:
+                    return row
+            if not rows or ("total" in response and page * 100 >= int(response["total"])):
+                break
         raise BinanceClientError(f"Flexible Earn product {product_id} was not found in account positions")
 
     async def subscribe_flexible(
@@ -66,6 +69,7 @@ class InvestmentService:
         parsed_amount = _decimal("amount", amount)
         if source_account not in ("SPOT", "FUND", "ALL"):
             raise BinanceClientError("sourceAccount must be SPOT, FUND, or ALL")
+        self.checkpoint("earn_subscribe_sending", {"productId": product_id, "amount": _string_decimal(parsed_amount)})
         response = await self.client.simple_earn_subscribe(
             product_id,
             _string_decimal(parsed_amount),
@@ -90,6 +94,7 @@ class InvestmentService:
         parsed_amount = _decimal("amount", amount)
         if dest_account not in ("SPOT", "FUND"):
             raise BinanceClientError("destAccount must be SPOT or FUND")
+        self.checkpoint("earn_redeem_sending", {"productId": product_id, "amount": _string_decimal(parsed_amount)})
         response = await self.client.simple_earn_redeem(product_id, _string_decimal(parsed_amount), dest_account)
         return {
             "productId": product_id,
@@ -132,6 +137,9 @@ class InvestmentService:
             products = response.get("list", [])
             for product in products:
                 if str(product.get("id", "")) == product_id:
+                    if any(str(product.get(k, "")).upper() != str(v).upper()
+                           for k, v in (("optionType", option_type), ("exercisedCoin", exercised_coin), ("investCoin", invest_coin))):
+                        raise BinanceClientError("Dual Investment product contract does not match requested pair")
                     return product
             total = int(response.get("total", 0) or 0)
             if not products or page_index * 100 >= total:
@@ -240,8 +248,10 @@ class InvestmentService:
         response = await self.client.signed_get("spot", DUAL_POSITIONS_PATH, params)
         if not isinstance(response, dict):
             raise BinanceClientError("unexpected Dual Investment positions response")
-        normalized = [self._normalize_position(item) for item in response.get("list", [])]
-        return {"total": response.get("total", len(normalized)), "positions": normalized}
+        if not isinstance(response.get("list"), list):
+            raise BinanceClientError("Dual Investment positions coverage missing")
+        normalized = [self._normalize_position(item) for item in response["list"]]
+        return {"total": response.get("total"), "positions": normalized}
 
     @staticmethod
     def _normalize_position(item: dict[str, Any]) -> dict[str, Any]:
@@ -261,30 +271,62 @@ class InvestmentService:
             "subscriptionTime": item.get("subscriptionTime"),
         }
 
+    async def all_positions(self) -> list[dict[str, Any]]:
+        coverage = Coverage()
+        rows: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for page in range(1, 101):
+            result = await self.positions(page_size=100, page_index=page)
+            batch = result["positions"]
+            identifiers = {str(p["positionId"]) for p in batch}
+            if seen & identifiers or len(identifiers) != len(batch):
+                raise BinanceClientError("Dual Investment pagination repeated; coverage incomplete")
+            seen.update(identifiers)
+            rows.extend(batch)
+            total = result["total"]
+            if coverage.complete(total, len(rows), len(batch)):
+                return rows
+        raise BinanceClientError("Dual Investment pagination limit reached; coverage incomplete")
+
     async def _verify_subscription(
-        self,
-        *,
-        product: dict[str, Any],
-        deposit_amount: str,
-        auto_compound_plan: AutoCompoundPlan,
+        self, *, product: dict[str, Any], deposit_amount: str,
+        auto_compound_plan: AutoCompoundPlan, response: dict | None = None,
+        previous_ids: set[str] | None = None,
     ) -> dict[str, Any]:
-        target_order_id = product.get("orderId")
-        target_amount = _decimal("depositAmount", deposit_amount)
-        response = await self.positions(page_size=100, page_index=1)
-        for position in response["positions"]:
-            if position.get("orderId") != target_order_id:
+        position_id = (response or {}).get("positionId", (response or {}).get("id"))
+        matches = []
+        for position in await self.all_positions():
+            if str(position.get("positionId")) in (previous_ids or set()):
                 continue
-            if position.get("depositAmount") is None:
+            if position_id is not None and str(position.get("positionId")) != str(position_id):
                 continue
-            if _decimal("position depositAmount", position["depositAmount"]) != target_amount:
+            if str(position.get("orderId")) != str(product.get("orderId")):
                 continue
-            if str(position.get("strikePrice")) != str(product.get("strikePrice")):
+            if position.get("status") != "PURCHASE_SUCCESS":
+                continue
+            if any(str(position.get(field, "")).upper() != str(product.get(field, "")).upper()
+                   for field in ("investCoin", "exercisedCoin", "optionType")):
                 continue
             plan = position.get("autoCompoundPlan")
-            if plan is not None and str(plan).upper() != auto_compound_plan:
+            if plan == "NULL":
+                plan = "NONE"
+            if plan != auto_compound_plan:
                 continue
-            return position
-        raise BinanceClientError("subscription POST succeeded but matching Dual Investment position was not verified")
+            if str(position.get("settlementDate")) != str(product.get("settleDate")):
+                continue
+            try:
+                if any(_decimal("contract " + field, position.get(field, ""), allow_zero=True)
+                       != _decimal("product " + field, expected, allow_zero=True)
+                       for field, expected in (("depositAmount", deposit_amount),
+                                               ("strikePrice", product.get("strikePrice", "")),
+                                               ("apr", product.get("apr", "")))):
+                    continue
+            except BinanceClientError:
+                continue
+            matches.append(position)
+        if len(matches) == 1:
+            return matches[0]
+        raise BinanceClientError("matching new Dual Investment position not verified; reconcile without resubmitting")
 
     async def subscribe_dual(
         self,
@@ -311,20 +353,28 @@ class InvestmentService:
         order_id = product.get("orderId")
         if order_id is None:
             raise BinanceClientError("Dual Investment product is missing orderId")
-        response = await self.client.dual_investment_subscribe(
-            product_id,
-            int(order_id),
-            amount,
-            auto_compound_plan,
-        )
+        previous_ids = {str(p["positionId"]) for p in await self.all_positions()}
+        self.checkpoint("dual_sending", {"product": product, "previousPositionIds": sorted(previous_ids)})
+        try:
+            response = await self.client.dual_investment_subscribe(
+                product_id, int(order_id), amount, auto_compound_plan,
+            )
+        except BinanceClientError as exc:
+            rejected = exc.definitive_rejection
+            return {"subscribed": False if rejected else None, "verified": False,
+                    "outcome": "REJECTED" if rejected else "OUTCOME_UNKNOWN",
+                    "fundsLocation": "UNKNOWN", "reason": str(exc), "product": product,
+                    "previousPositionIds": sorted(previous_ids), "guards": guard}
         try:
             position = await self._verify_subscription(
                 product=product,
                 deposit_amount=amount,
                 auto_compound_plan=auto_compound_plan,
+                response=response, previous_ids=previous_ids,
             )
         except BinanceClientError as exc:
             return {
+                "previousPositionIds": sorted(previous_ids),
                 "subscribed": True,
                 "verified": False,
                 "reason": str(exc),
@@ -390,11 +440,13 @@ class InvestmentService:
         )
 
         spot_before = await self._spot_free(invest_coin)
+        self.checkpoint("earn_redeem_sending", {"product": product, "spotBefore": str(spot_before)})
         redeem_response = await self.client.simple_earn_redeem(
             earn_product_id,
             _string_decimal(redeem_amount),
             "SPOT",
         )
+        self.checkpoint("earn_redeem_accepted", {"redeemResponse": redeem_response})
         spot_after = await self._spot_free(invest_coin)
         expected_after = spot_before + redeem_amount
         if spot_after < expected_after:
@@ -447,6 +499,9 @@ class InvestmentService:
                 "preflight": preflight,
             }
 
+        previous_ids = {str(p["positionId"]) for p in await self.all_positions()}
+        self.checkpoint("dual_sending", {"product": refreshed, "previousPositionIds": sorted(previous_ids),
+                                         "redeemResponse": redeem_response})
         try:
             subscribe_response = await self.client.dual_investment_subscribe(
                 dual_product_id,
@@ -455,17 +510,14 @@ class InvestmentService:
                 auto_compound_plan,
             )
         except BinanceClientError as exc:
+            rejected = exc.definitive_rejection
             return {
-                "redeemed": True,
-                "subscribed": False,
-                "verified": True,
-                "reason": f"subscription failed after redemption: {exc}",
-                "fundsLocation": "SPOT",
-                "earnRemaining": _string_decimal(remaining),
-                "spotBalance": _string_decimal(spot_after),
-                "redeemResponse": redeem_response,
-                "preflight": preflight,
-                "postRedemptionGuards": refreshed_guard,
+                "redeemed": True, "subscribed": False if rejected else None,
+                "verified": False, "outcome": "REJECTED" if rejected else "OUTCOME_UNKNOWN",
+                "reason": str(exc), "fundsLocation": "UNKNOWN",
+                "earnRemaining": _string_decimal(remaining), "redeemResponse": redeem_response,
+                "preflight": preflight, "postRedemptionGuards": refreshed_guard,
+                "previousPositionIds": sorted(previous_ids),
             }
 
         try:
@@ -473,6 +525,7 @@ class InvestmentService:
                 product=refreshed,
                 deposit_amount=_string_decimal(redeem_amount),
                 auto_compound_plan=auto_compound_plan,
+                response=subscribe_response, previous_ids=previous_ids,
             )
         except BinanceClientError as exc:
             return {
@@ -481,6 +534,7 @@ class InvestmentService:
                 "verified": False,
                 "reason": str(exc),
                 "fundsLocation": "DUAL_INVESTMENT_OR_PENDING",
+                "previousPositionIds": sorted(previous_ids),
                 "earnRemaining": _string_decimal(remaining),
                 "redeemResponse": redeem_response,
                 "subscribeResponse": subscribe_response,

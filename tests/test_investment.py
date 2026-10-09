@@ -67,7 +67,8 @@ class FakeClient:
             self.spot_balance_calls += 1
             return {"balances": [{"asset": "USDT", "free": free, "locked": "0"}]}
         if path == "/sapi/v1/dci/product/positions":
-            return {"total": len(self.positions_data), "list": self.positions_data}
+            rows = self.positions_data if self.subscribe_calls else []
+            return {"total": len(rows), "list": rows}
         raise AssertionError(f"unexpected signed GET {path}")
 
     async def public_get(self, product_name, path, params=None):
@@ -283,3 +284,84 @@ async def test_trading_disabled_blocks_financial_workflow_before_reads():
             amount="700",
             preserve_earn_amount="500",
         )
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field,value", [("purchaseStatus", "PURCHASE_FAIL"), ("purchaseStatus", "PENDING"),
+    ("exercisedCoin", "ETH"), ("investCoin", "USDC"), ("optionType", "CALL"),
+    ("apr", "0.3"), ("settleDate", 1), ("autoCompoundPlan", "STANDARD"), ("id", "wrong-id")])
+async def test_verification_rejects_wrong_contract(field, value):
+    row = matching_position()
+    row[field] = value
+    client = FakeClient(positions=[row])
+    result = await InvestmentService(client).subscribe_dual(product_id="2650584", option_type="PUT",
+        exercised_coin="BTC", invest_coin="USDT", deposit_amount="700")
+    assert result["verified"] is False
+    assert len(client.subscribe_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_accepted_subscription_followed_by_504_never_claims_verified_spot():
+    class AcceptedTimeout(FakeClient):
+        async def dual_investment_subscribe(self, *args):
+            await super().dual_investment_subscribe(*args)
+            raise BinanceClientError("HTTP 504", status=504, outcome_unknown=True)
+    client = AcceptedTimeout(positions=[matching_position()])
+    result = await InvestmentService(client).from_flexible_earn(earn_product_id="USDT001", dual_product_id="2650584",
+        option_type="PUT", exercised_coin="BTC", invest_coin="USDT", amount="700", preserve_earn_amount="500")
+    assert result["subscribed"] is None
+    assert result["verified"] is False
+    assert result["outcome"] == "OUTCOME_UNKNOWN"
+    assert result["fundsLocation"] == "UNKNOWN"
+    assert "spotBalance" not in result
+    assert len(client.subscribe_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_position_id_previous_position_and_delayed_visibility():
+    client = FakeClient(positions=[matching_position()])
+    service = InvestmentService(client)
+    with pytest.raises(BinanceClientError, match="not verified"):
+        await service._verify_subscription(product=product(), deposit_amount="700", auto_compound_plan="NONE",
+            response={"positionId": "position-1"}, previous_ids={"position-1"})
+    client.subscribe_calls.append((1,))
+    row = await service._verify_subscription(product=product(), deposit_amount="700", auto_compound_plan="NONE",
+        response={"positionId": "position-1"}, previous_ids=set())
+    assert row["positionId"] == "position-1"
+
+
+@pytest.mark.asyncio
+async def test_verification_paginates_and_uses_numeric_decimal_equivalence():
+    class Paged(FakeClient):
+        async def signed_get(self, product_name, path, params=None):
+            if path.endswith("/positions"):
+                if not self.subscribe_calls:
+                    return {"total": 0, "list": []}
+                if params["pageIndex"] == 1:
+                    return {"total": 101, "list": [{**matching_position(), "id": str(i), "exercisedCoin": "ETH"} for i in range(100)]}
+                return {"total": 101, "list": [{**matching_position(), "strikePrice": "77500.000", "apr": "0.200800"}]}
+            return await super().signed_get(product_name, path, params)
+    client = Paged()
+    result = await InvestmentService(client).subscribe_dual(product_id="2650584", option_type="PUT",
+        exercised_coin="BTC", invest_coin="USDT", deposit_amount="700")
+    assert result["verified"]
+    assert len(client.subscribe_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_saga_checkpoint_precedes_each_write_and_records_refreshed_contract():
+    client = FakeClient(positions=[matching_position()])
+    service = InvestmentService(client)
+    stages = []
+    def checkpoint(phase, data):
+        if phase == "earn_redeem_sending":
+            assert not client.redeem_calls
+        if phase == "dual_sending":
+            assert not client.subscribe_calls
+            assert data["product"]["apr"] == "0.2008"
+            assert data["previousPositionIds"] == []
+        stages.append(phase)
+    service.checkpoint = checkpoint
+    result = await service.from_flexible_earn(earn_product_id="USDT001", dual_product_id="2650584", option_type="PUT",
+        exercised_coin="BTC", invest_coin="USDT", amount="700", preserve_earn_amount="500")
+    assert result["verified"]
+    assert stages == ["earn_redeem_sending", "earn_redeem_accepted", "dual_sending"]
