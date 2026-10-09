@@ -145,6 +145,8 @@ class ExecutionService:
             if not info.get("ocoAllowed", False) or (operation == "otoco" and not info.get("otoAllowed", False)):
                 raise BinanceClientError("symbol does not permit requested linked orders")
         asset = info["quoteAsset"] if side == "BUY" else info["baseAsset"]
+        if cfg["mode"] == "live" and side == "SELL":
+            self.require_spot_backing(asset, account)
         reservation = qty * price * (1 + fee_rate) if side == "BUY" else qty
         if self.ledger.available(strategy, asset) < reservation:
             raise BinanceClientError("insufficient available strategy capital")
@@ -574,6 +576,27 @@ class ExecutionService:
                 await self.reconcile(intent["id"])
             except Exception:
                 self.ledger.pause("reconciliation incomplete for " + intent["id"])
+
+    def require_spot_backing(self, asset: str, account: dict) -> None:
+        """Recovery cannot spend Spot capital backing another live allocation."""
+        try:
+            balances = account.get("balances")
+            if not isinstance(balances, list) or any(not isinstance(b, dict) or "asset" not in b for b in balances):
+                raise BinanceClientError("Spot ownership coverage incomplete")
+            matches = [b for b in balances if b["asset"] == asset]
+            if len(matches) > 1:
+                raise BinanceClientError("Spot ownership coverage incomplete")
+            backing = (number(matches[0]["free"], zero=True) + number(matches[0]["locked"], zero=True)) if matches else Decimal(0)
+            required = sum((Decimal(row["quantity"]) for row in self.ledger.db.execute(
+                "SELECT b.quantity FROM balances b JOIN strategies s ON b.strategy=s.id "
+                "WHERE s.mode='live' AND b.asset=? AND b.location IN ('SPOT','PROFIT_RESERVE')", (asset,))), Decimal(0))
+            if backing < required:
+                raise BinanceClientError("strategy capital is not backed at its recorded Spot location")
+        except (BinanceClientError, KeyError, TypeError, AttributeError) as exc:
+            self.ledger.pause("account location ownership requires reconciliation")
+            if isinstance(exc, BinanceClientError):
+                raise
+            raise BinanceClientError("Spot ownership coverage incomplete") from exc
 
     async def check_account(self) -> dict:
         snapshot = await self.snapshots.portfolio()

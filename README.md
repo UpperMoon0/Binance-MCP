@@ -12,6 +12,8 @@ After a redemption is accepted, a later read rejection retains the saga checkpoi
 
 Capital is tracked by strategy, asset and location (`SPOT`, `EARN:productId`, `DI:positionId`, `PROFIT_RESERVE`). Configure separate allocations for an experiment, conservative holdings and an ETH buyback reserve. One strategy cannot sell or redeem another strategy's holdings. The ledger is not a lifetime turnover counter.
 
+Recovery SELL and OCO requests can proceed during a protection pause only after a fresh Spot account read backs the aggregate ownership of the sold asset across every live strategy. This includes non-spendable profit reserves and both free and locked Spot balances; holdings in Earn or DI cannot back a Spot sale. Missing or invalid balance evidence blocks submission. The request must also fit the requesting strategy's unreserved capital and the account's free balance. Cancellation remains available during ownership pauses and account-read failures.
+
 ### Configuration
 
 ```dotenv

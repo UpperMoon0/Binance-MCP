@@ -2,6 +2,7 @@
 
 ## 0.2.0
 
+- Require fresh aggregate Spot backing across live strategies, including profit reserves, before recovery SELL/OCO submission; cancellation remains available during ownership pauses.
 - Keep accepted Earn redemption checkpoints and reservations recoverable when a later saga read is rejected.
 - Persist the active paper OCO/OTOCO exit leg; partial fills cannot execute the canceled sibling, and activated stops remain market orders.
 - Reject truncated pagination and changing advertised totals in account snapshots and Dual Investment reads.
