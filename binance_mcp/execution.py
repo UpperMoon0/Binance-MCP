@@ -313,7 +313,21 @@ class ExecutionService:
     async def investment_preflight(self, strategy: str, op: str, p: dict) -> tuple[dict, str, str, str]:
         cfg = self.ledger.strategy(strategy)
         amount = str(number(p["amount"]))
-        if op.startswith("earn_"):
+        product = None
+        if op == "earn_subscribe":
+            products = await self.snapshots.pages("/sapi/v1/simple-earn/flexible/list", extra={"asset": cfg["quote"]})
+            matches = [item for item in products if str(item.get("productId")) == p["productId"]]
+            if len(matches) != 1:
+                raise BinanceClientError("Flexible Earn subscription product unavailable or ambiguous")
+            product = matches[0]
+            asset = product.get("asset")
+            if product.get("canPurchase") is not True or product.get("isSoldOut") is not False or product.get("status") != "PURCHASING":
+                raise BinanceClientError("Flexible Earn product is not currently purchasable")
+            if number(amount) < number(product["minPurchaseAmount"], zero=True):
+                raise BinanceClientError("amount is below Flexible Earn minimum purchase")
+            if int(product["subscriptionStartTime"]) > int(time.time() * 1000):
+                raise BinanceClientError("Flexible Earn subscription window has not started")
+        elif op in ("earn_redeem", "earn_to_dual"):
             position = await self.investment.flexible_position(p["productId"] if op != "earn_to_dual" else p["earnProductId"])
             asset = position.get("asset")
             if not asset:
@@ -328,7 +342,7 @@ class ExecutionService:
         location = "EARN:" + p.get("productId", p.get("earnProductId", "")) if op in ("earn_redeem", "earn_to_dual") else "SPOT"
         if self.ledger.available(strategy, asset, location) < number(amount):
             raise BinanceClientError("investment exceeds strategy-owned funds")
-        contract = {}
+        contract = {"product": product} if product is not None else {}
         if op in ("dual_subscribe", "earn_to_dual"):
             product = await self.investment.dual_product(p["dualProductId"], p["optionType"], p["exercisedCoin"], p["investCoin"])
             contract = await self.investment.validate_dual_product(product, amount, p.get("minimumApr"),
@@ -543,9 +557,10 @@ class ExecutionService:
         records = await self.snapshots.pages("/sapi/v1/simple-earn/flexible/history/" + ("subscriptionRecord" if op == "earn_subscribe" else "redemptionRecord"),
                      extra={"startTime": preview["historyStart"], "endTime": int(time.time() * 1000)})
         id_field = "purchaseId" if op == "earn_subscribe" else "redeemId"
+        terminal_status = "SUCCESS" if op == "earn_subscribe" else "PAID"
         matches = [r for r in records if str(r.get(id_field)) == str(record_id)
                    and r.get("productId", r.get("projectId")) == product_id and r.get("asset") == intent["asset"]
-                   and number(r["amount"]) == number(p["amount"]) and r.get("status") == "SUCCESS"]
+                   and number(r["amount"]) == number(p["amount"]) and r.get("status") == terminal_status]
         if len(matches) != 1:
             raise BinanceClientError("Earn history has not verified exact transfer")
 

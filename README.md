@@ -98,6 +98,8 @@ Live fee payments in a third asset (for example BNB discount) are refused at pre
 
 Transport failures, timeouts, server errors and non-authoritative error responses are `OUTCOME_UNKNOWN`. Their reservations survive restarts. Only recognized Binance validation/permission rejections release a reservation. Absence from a history page is not proof of rejection. No financial write is automatically retried, swept into Earn, or substituted with another product.
 
+Flexible Earn subscriptions preflight the live product catalog, so a first subscription or rotation does not require an existing account position. Metadata must confirm a matching asset, purchasable status, availability and the minimum/start-time guards. Redemptions still require an owned redeemable position. Exchange history verifies `SUCCESS` for subscriptions and `PAID` for completed redemptions, including partial Earn-to-DI recovery.
+
 DI verification requires an acceptable `PURCHASE_SUCCESS` status, the returned position ID when present, a newly visible position excluded from the pre-request position set, and matching deposit, assets, direction, strike, APR, settlement and compounding plan. Numeric decimals are compared numerically. All pages are read within a bounded limit; incomplete or repeated pagination fails closed. Binance's explicit `NULL` plan is normalized as no compounding; a missing plan is not proof.
 
 The Earn-to-DI workflow preserves `preserveEarnAmount`, verifies Spot receipt and re-fetches the same product after redemption. If the DI request then times out, the result never claims the pre-request Spot balance is verified. Exact recovery uses DI positions and Earn history; ambiguous records without a unique write identifier require owner reconciliation. A safe partial completion leaves the funds owned by the same strategy, never spends them as another strategy's cash.
@@ -106,7 +108,7 @@ The Earn-to-DI workflow preserves `preserveEarnAmount`, verifies Spot receipt an
 
 The app lifespan starts a small monitor independently of any research cycle. It subscribes to Binance's signed `userDataStream.subscribe.signature` WebSocket API, reacts to account/order/list events and reconciles with REST every 30 seconds (configurable 5..60). It synchronizes server time, detects outside activity, verifies protection, and checks account coverage. Stream disconnects, stale monitor state over 90 seconds and unresolved executions block entries. Recovery never resends a financial write.
 
-The monitor clears only operational pauses after all corresponding checks pass. Outside/manual account changes, rewards and DI settlement mismatches require an attributed owner audit. Health and strategy status expose readiness; transport/authentication health alone does not imply funds are reconciled or an entry is protected.
+The monitor clears only operational pauses after all corresponding checks pass. A reconciliation failure anywhere in the live tick retains the pause and last successful monitor timestamp, even if the journal previously recorded active protective orders. Outside/manual account changes, rewards and DI settlement mismatches require an attributed owner audit. Health and strategy status expose readiness; transport/authentication health alone does not imply funds are reconciled or an entry is protected.
 
 ### Accounting audits
 

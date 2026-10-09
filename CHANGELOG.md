@@ -2,6 +2,10 @@
 
 ## 0.2.0
 
+- Correct Flexible Earn redemption history verification to require PAID while subscriptions require SUCCESS.
+- Preflight new Flexible Earn subscriptions from live product metadata, retaining owned-position checks for redemptions.
+- Preserve operational pauses and the last successful monitor timestamp when a live reconciliation tick fails.
+
 - Fix unknown DI subscription outcomes being reported as verified Spot failures.
 - Verify complete newly created DI contracts, returned identifiers, statuses and all pages.
 - Add persistent decimal strategy allocations, shared reservations, idempotent intent journal, saga checkpoints and categorized P&L.

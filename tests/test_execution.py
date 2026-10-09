@@ -319,7 +319,7 @@ async def test_guard_failed_after_redemption_recovers_spot_from_unique_history(t
     original = client.signed_get
     async def signed(product_name, path, params=None):
         if path.endswith("redemptionRecord"):
-            return {"total": 1, "rows": [{"redeemId": "r1", "projectId": "USDT001", "asset": "USDT", "amount": "700", "status": "SUCCESS"}]}
+            return {"total": 1, "rows": [{"redeemId": "r1", "projectId": "USDT001", "asset": "USDT", "amount": "700", "status": "PAID"}]}
         return await original(product_name, path, params)
     client.signed_get = signed
     result = await ExecutionService(client, ledger, ["BTCUSDT"]).reconcile("redeemed")

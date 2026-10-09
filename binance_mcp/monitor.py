@@ -46,6 +46,7 @@ class Monitor:
     async def tick(self):
         svc, ledger = self.execution, self.execution.ledger
         async with svc.lock:
+            live_failures = []
             for intent in ledger.outstanding():
                 try:
                     await svc.reconcile(intent["id"])
@@ -53,7 +54,12 @@ class Monitor:
                     if ledger.strategy(intent["strategy"])["mode"] == "paper":
                         ledger.set_meta("paperPause:" + intent["strategy"], "paper reconciliation incomplete for " + intent["id"])
                     else:
+                        live_failures.append(intent["id"])
                         ledger.pause("reconciliation incomplete for " + intent["id"])
+            if live_failures:
+                # Stored protection is historical evidence, not a successful query in
+                # this tick. Preserve the last successful monitor timestamp and pause.
+                raise BinanceClientError("reconciliation incomplete for " + ", ".join(live_failures))
             if ledger.db.execute("SELECT 1 FROM strategies WHERE mode='live'").fetchone():
                 await svc.client.sync_time()
                 await svc.check_account()
