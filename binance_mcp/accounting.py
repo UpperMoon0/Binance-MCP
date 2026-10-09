@@ -52,13 +52,15 @@ def apply_audit(ledger: Ledger, audit: dict, observed_totals: dict[str, str]) ->
             raise BinanceClientError("audit does not explain complete observed account totals")
         for index, adjustment in enumerate(audit.get("adjustments", [])):
             strategy = adjustment["strategyId"]
-            ledger.strategy(strategy)
+            cfg = ledger.strategy(strategy)
             category = adjustment["category"]
             if category not in CATEGORIES:
                 raise BinanceClientError("unsupported accounting category")
             quantity = signed_decimal(adjustment["quantityDelta"])
             cost = signed_decimal(adjustment.get("costDelta", "0"))
             quote_value = signed_decimal(adjustment.get("quoteValue", "0"))
+            if adjustment['asset'] != cfg['quote'] and quantity > 0 and cost <= 0:
+                raise BinanceClientError('positive non-quote attribution needs audited receipt cost basis')
             ledger.change(strategy, adjustment["asset"], adjustment["location"], quantity, cost)
             ledger.event(key + ":" + str(index), strategy, category, adjustment["asset"], quantity, quote_value,
                          detail={"evidence": audit["evidence"], "adjustment": adjustment})

@@ -49,6 +49,8 @@ class Ledger:
                 category TEXT NOT NULL, asset TEXT NOT NULL, amount TEXT NOT NULL,
                 quote_value TEXT NOT NULL, created INTEGER NOT NULL, detail TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY, source TEXT NOT NULL,
+                strategy TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL, detail TEXT NOT NULL);
         """)
         with self.transaction():
             for key, cfg in (allocations or {}).items():
@@ -75,6 +77,33 @@ class Ledger:
                                 (key, mode, quote, str(amount), int(cfg.get("reinvest", True))))
                 self.db.execute("INSERT INTO balances VALUES(?,?,?,?,?)", (key, quote, location, str(amount), "0"))
                 self.set_meta("allocationPolicy:" + key, policy_digest)
+            # Risk/recovery policies are owner configuration, separate from funding.
+            # Reopening a database without configuration preserves the approved policy.
+            from .policy import validate
+            for key, cfg in (allocations or {}).items():
+                for field in ("riskPolicy", "recoveryPolicy"):
+                    if field not in cfg:
+                        continue
+                    value = cfg[field]
+                    if field == "riskPolicy":
+                        validate(value)
+                    else:
+                        from .incidents import validate_recovery
+                        validate_recovery(value)
+                    saved = self.meta(field + ":" + key)
+                    if saved is not None and saved != value:
+                        raise BinanceClientError("existing " + field + " is immutable; owner migration required")
+                    self.set_meta(field + ":" + key, value)
+
+    @classmethod
+    def open_readonly(cls, path: str):
+        """Inspect an existing ledger without schema initialization or WAL changes."""
+        if not Path(path).is_file():
+            raise BinanceClientError('existing ledger required for passive inspection')
+        ledger = cls.__new__(cls)
+        ledger.db = sqlite3.connect(Path(path).resolve().as_uri() + '?mode=ro', uri=True, isolation_level=None)
+        ledger.db.row_factory = sqlite3.Row
+        return ledger
 
     @contextmanager
     def transaction(self):
@@ -145,6 +174,9 @@ class Ledger:
                 if self.db.execute("SELECT 1 FROM intents i JOIN strategies s ON i.strategy=s.id "
                                    "WHERE s.mode='live' AND i.state IN ('PREPARED','OUTCOME_UNKNOWN')").fetchone():
                     raise BinanceClientError("unresolved execution blocks further expenditure")
+            if prepared and prepared.get("preview", {}).get("operation") in ("otoco", "earn_subscribe", "dual_subscribe", "earn_to_dual"):
+                from .policy import entry_check
+                entry_check(self, strategy, prepared["preview"])
             if self.available(strategy, asset, location) < amount_d:
                 raise BinanceClientError("insufficient available strategy capital")
             self.db.execute("INSERT INTO intents VALUES(?,?,?,?,?,?,?,?,?,?,?)",

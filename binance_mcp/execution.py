@@ -10,8 +10,26 @@ from .client import BinanceClientError
 from .investment import InvestmentService
 from .ledger import Ledger, number
 from .snapshots import Snapshots
+from . import fees, policy
 
 TERMINAL = {"FILLED", "CANCELED", "EXPIRED", "EXPIRED_IN_MATCH", "REJECTED"}
+
+
+def spot_permissions(account: dict, info: dict) -> bool:
+    permissions = account.get("permissions")
+    if account.get("canTrade") is not True or not isinstance(permissions, list) or not permissions or any(not isinstance(p, str) or not p for p in permissions):
+        return False
+    if account.get('accountType') not in (None, 'SPOT'):
+        return False
+    sets = info.get("permissionSets")
+    # Older exchangeInfo omits permissionSets. Only literal SPOT is accepted there.
+    if "permissionSets" not in info:
+        return "SPOT" in permissions
+    if not isinstance(sets, list) or not sets:
+        return False
+    return all(isinstance(group, list) and bool(group) and
+               all(isinstance(p, str) and bool(p) for p in group) and
+               bool(set(group) & set(permissions)) for group in sets)
 
 
 def client_id(intent: str, suffix: str = "") -> str:
@@ -24,6 +42,7 @@ class ExecutionService:
         self.snapshots = Snapshots(client, ledger, symbols)
         self.investment = InvestmentService(client)
         self.lock = asyncio.Lock()
+        self.incident_sink_configured = False
 
     async def symbol(self, symbol: str) -> dict:
         if symbol not in self.snapshots.symbols:
@@ -60,6 +79,7 @@ class ExecutionService:
                     raise BinanceClientError("price violates percent price filter")
 
     async def preview(self, strategy: str, operation: str, params: dict) -> dict:
+        started_at = int(time.time()*1000)
         cfg = self.ledger.strategy(strategy)
         if operation not in ("order", "oco", "otoco"):
             raise BinanceClientError("preview supports order, oco or otoco")
@@ -92,25 +112,20 @@ class ExecutionService:
                 for r in self.ledger.db.execute("SELECT asset,quantity FROM balances WHERE strategy=? AND location='SPOT'", (strategy,))]}
             commission = {k: {"maker": rate, "taker": rate, "buyer": "0", "seller": "0"}
                           for k, rate in (("standardCommission", "0.001"), ("taxCommission", "0"), ("specialCommission", "0"))}
+            commission["discount"] = {"enabledForAccount": False, "enabledForSymbol": False}
         else:
             account, commission = await asyncio.gather(
                 self.client.signed_get("spot", "/api/v3/account"),
                 self.client.signed_get("spot", "/api/v3/account/commission", {"symbol": info["symbol"]}),
             )
-        discount = commission.get("discount", {})
-        if cfg["mode"] == "live" and discount.get("enabledForAccount") and discount.get("enabledForSymbol"):
-            raise BinanceClientError("third-asset commission payment unsupported; disable Binance fee discount before managed trading")
-        if not account.get("canTrade") or "SPOT" not in account.get("permissions", []):
-            raise BinanceClientError("account lacks Spot trading permission")
-        fee_rate = Decimal(0)
-        for key in ("standardCommission", "taxCommission", "specialCommission"):
-            rates = commission.get(key)
-            if rates is None:
-                raise BinanceClientError("commission coverage incomplete")
-            fee_rate += max(number(rates["maker"], zero=True), number(rates["taker"], zero=True))
-            fee_rate += max(number(rates["buyer"], zero=True), number(rates["seller"], zero=True))
-        if fee_rate >= 1:
-            raise BinanceClientError("invalid commission rate")
+        if commission.get('symbol') not in (None, info['symbol']):
+            raise BinanceClientError('commission symbol contradicts request', blocker='FEE_EVIDENCE')
+        fee_compatibility = fees.inspect(commission)
+        if not fee_compatibility['compatible']:
+            raise BinanceClientError("third-asset commission payment unsupported; owner-approved account configuration required", blocker="UNSUPPORTED_FEE_ASSET")
+        if not spot_permissions(account, info):
+            raise BinanceClientError("account lacks Spot trading permission", blocker="PERMISSIONS")
+        fee_rate = number(fee_compatibility['feeRateBound'], zero=True)
         bid, ask = number(book["bidPrice"]), number(book["askPrice"])
         if bid > ask:
             raise BinanceClientError("invalid order book")
@@ -200,12 +215,22 @@ class ExecutionService:
                               for o in (all_orders if kind.startswith("EXCHANGE") else orders))
                 if current + (1 if operation in ("oco", "otoco") else 0) > int(f["maxNumAlgoOrders"]):
                     raise BinanceClientError("algorithmic order count guard failed")
-        return {"observedAt": int(time.time() * 1000), "strategyId": strategy, "operation": operation,
+        result = {"observedAt": started_at, "strategyId": strategy, "operation": operation,
                 "params": params, "base": info["baseAsset"], "quote": info["quoteAsset"],
                 "asset": asset, "reservation": str(reservation), "sellableQuantity": str(sellable),
-                "feeRateBound": str(fee_rate), "spreadBps": str(spread), "slippageBps": str(slippage),
+                "feeCompatibility": fee_compatibility, "feeRateBound": str(fee_rate), "spreadBps": str(spread), "slippageBps": str(slippage),
                 "filters": info["filters"], "bookTicker": book,
                 "protection": "PENDING_FULL_FILL" if operation == "otoco" else "REQUIRES_RECONCILIATION"}
+        policy.authorize(self.ledger, strategy, operation, [info['baseAsset'], info['quoteAsset']])
+        if operation == 'otoco' and self.ledger.meta('riskPolicy:' + strategy):
+            prices = {}
+            for row in self.ledger.db.execute("SELECT DISTINCT asset FROM balances WHERE strategy=? AND asset!=? AND quantity!='0'", (strategy, cfg['quote'])):
+                observation = await self.client.public_get('spot', '/api/v3/ticker/bookTicker', {'symbol': row['asset'] + cfg['quote']})
+                prices[row['asset']] = str(number(observation['bidPrice']))
+            result['riskEvidence'] = {'observedAt': started_at, 'prices': prices}
+            policy.entry_check(self.ledger, strategy, result)
+        return result
+
 
     def order_params(self, intent_id: str, preview: dict) -> tuple[str, dict]:
         p, op = preview["params"], preview["operation"]
@@ -238,19 +263,37 @@ class ExecutionService:
             cfg = self.ledger.strategy(strategy)
             if cfg["mode"] == "paper" and operation not in ("cancel", "oco", "order") and self.ledger.meta("paperPause:" + strategy):
                 raise BinanceClientError("paper strategy paused: " + self.ledger.meta("paperPause:" + strategy))
+            policy.authorize(self.ledger, strategy, operation, [cfg['quote']])
             if cfg["mode"] == "live":
                 self.client._require_trading()
+                if operation not in ('order', 'oco', 'cancel'):
+                    if not self.ledger.meta('recoveryPolicy:' + strategy):
+                        raise BinanceClientError('owner recovery policy required', blocker='RECOVERY_POLICY_REQUIRED')
+                    if not self.incident_sink_configured:
+                        raise BinanceClientError('operator incident channel required', blocker='INCIDENT_CHANNEL_UNCONFIGURED')
                 await self.reconcile_all()
                 if operation not in ("cancel", "oco", "order"):
-                    last = self.ledger.meta("monitorAt")
+                    last = self.ledger.meta("protectionAt")
                     if not last or int(time.time() * 1000) - last > 90000 or not self.ledger.meta("streamConnected"):
                         self.ledger.pause("user stream or operational account state stale")
                         raise BinanceClientError("operational monitor is stale or disconnected")
                     await self.check_account()
                     await self.check_protection()
             if operation in ("order", "oco", "otoco"):
-                preview = await self.preview(strategy, operation, params)
+                try:
+                    preview = await self.preview(strategy, operation, params)
+                except BinanceClientError as exc:
+                    if exc.blocker == 'LOSS_PAUSED':
+                        self.ledger.set_meta('riskPause:' + strategy, {'code': 'LOSS_PAUSED', 'observedAt': int(time.time()*1000)})
+                    if cfg["mode"] == "live" and operation in ("order", "oco"):
+                        self.ledger.pause("owned exit validation requires reconciliation")
+                    raise
                 asset, location, reserve = preview["asset"], "SPOT", preview["reservation"]
+                if operation == 'otoco':
+                    try:
+                        policy.entry_check(self.ledger, strategy, preview, persist_loss=True)
+                    except BinanceClientError:
+                        raise
                 path, order = self.order_params(intent_id, preview)
             elif operation in ("earn_subscribe", "earn_redeem", "dual_subscribe", "earn_to_dual"):
                 preview, asset, location, reserve = await self.investment_preflight(strategy, operation, params)
@@ -266,9 +309,14 @@ class ExecutionService:
                          "listClientOrderId" if linked else "origClientOrderId": client_id(target["id"])}
             else:
                 raise BinanceClientError("unsupported execution operation")
-            intent, fresh = self.ledger.begin(intent_id, strategy, payload, asset, location, reserve,
-                                               recovery=operation in ("cancel", "oco", "order"),
-                                               prepared={"preview": preview, "path": path, "order": order})
+            try:
+                intent, fresh = self.ledger.begin(intent_id, strategy, payload, asset, location, reserve,
+                    recovery=operation in ('cancel', 'oco', 'order'),
+                    prepared={'preview': preview, 'path': path, 'order': order})
+            except BinanceClientError as exc:
+                if exc.blocker == 'LOSS_PAUSED':
+                    self.ledger.set_meta('riskPause:' + strategy, {'code': 'LOSS_PAUSED', 'observedAt': int(time.time()*1000)})
+                raise
             if not fresh:
                 return await self.reconcile(intent_id)
             self.ledger.update(intent_id, "PREPARED", result={"preview": preview, "path": path, "order": order})
@@ -305,6 +353,10 @@ class ExecutionService:
             except Exception as exc:
                 rejected = isinstance(exc, BinanceClientError) and exc.definitive_rejection
                 current = self.ledger.get(intent_id)
+                # A failed protection query invalidates historical protection claims.
+                if current['result'] and operation in ('oco', 'otoco'):
+                    current['result']['protected'] = False
+                    current['result']['protectionUncertain'] = True
                 # A rejection of a later request cannot undo an accepted saga step.
                 # Keep its checkpoint and reservation until history verifies ownership.
                 progress = current["result"] or {}
@@ -317,6 +369,7 @@ class ExecutionService:
             return self.ledger.get(intent_id)
 
     async def investment_preflight(self, strategy: str, op: str, p: dict) -> tuple[dict, str, str, str]:
+        started_at = int(time.time()*1000)
         cfg = self.ledger.strategy(strategy)
         amount = str(number(p["amount"]))
         product = None
@@ -362,8 +415,25 @@ class ExecutionService:
             raise BinanceClientError("managed investments use Spot funds only")
         if cfg["mode"] == "live" and location == "SPOT" and await self.investment._spot_free(asset) < number(amount):
             raise BinanceClientError("insufficient exchange free investment balance")
-        return {"amount": amount, "asset": asset, "location": location, "contract": contract,
-                "historyStart": int(time.time() * 1000)}, asset, location, amount
+        policy.authorize(self.ledger, strategy, op, [asset] + ([p['exercisedCoin']] if op in ('dual_subscribe', 'earn_to_dual') else []))
+        if op in ('dual_subscribe', 'earn_to_dual') and self.investment._spot_symbol(product) not in self.snapshots.symbols:
+            raise BinanceClientError('DI pair outside approved universe', blocker='POLICY_OPERATION')
+        preview = {"amount": amount, "asset": asset, "location": location, "contract": contract,
+                "historyStart": int(time.time() * 1000), 'operation': op, 'base': asset, 'quote': cfg['quote'],
+                'reservation': amount, 'feeRateBound': '0'}
+        if op != 'earn_redeem' and self.ledger.meta('riskPolicy:' + strategy):
+            prices = {}
+            for row in self.ledger.db.execute("SELECT DISTINCT asset FROM balances WHERE strategy=? AND asset!=? AND quantity!='0'", (strategy, cfg['quote'])):
+                book = await self.client.public_get('spot', '/api/v3/ticker/bookTicker', {'symbol': row['asset'] + cfg['quote']})
+                prices[row['asset']] = str(number(book['bidPrice']))
+            if prices:
+                # Investment paths do not weaken trading valuations by assuming free exits.
+                raise BinanceClientError('investment with open non-quote exposure requires trading valuation evidence', blocker='VALUATION_INCOMPLETE')
+            preview['riskEvidence'] = {'observedAt': started_at, 'prices': prices}
+            policy.entry_check(self.ledger, strategy, preview, persist_loss=True)
+        if int(time.time()*1000) - started_at > 90000:
+            raise BinanceClientError('investment observation stale', blocker='OBSERVATION_STALE')
+        return preview, asset, location, amount
 
     async def investment_write(self, op: str, p: dict) -> dict:
         if op == "earn_subscribe":
@@ -405,13 +475,15 @@ class ExecutionService:
             return await self.paper_reconcile(intent)
         op, p = intent["payload"]["operation"], intent["payload"]["params"]
         result = intent["result"] or {}
-        if op in ("order", "oco", "otoco"):
-            linked = op != "order"
+        if op in ("order", "oco", "otoco", "legacy_order"):
+            linked = op in ("oco", "otoco")
             response = await self.client.signed_get("spot", "/api/v3/orderList" if linked else "/api/v3/order",
-                        {"origClientOrderId": client_id(key), **({} if linked else {"symbol": p["symbol"]})})
+                        {"origClientOrderId": result.get('legacyClientOrderId', client_id(key)), **({} if linked else {"symbol": p["symbol"]})})
+            if linked and (not isinstance(response.get('orders'), list) or any(o.get('symbol') != p['symbol'] for o in response['orders'])):
+                raise BinanceClientError('list child references contradict symbol contract')
             orders = [response] if not linked else [await self.client.signed_get("spot", "/api/v3/order",
                       {"symbol": o["symbol"], "orderId": o["orderId"]}) for o in response["orders"]]
-            expected_ids = {client_id(key, s) for s in ("entry", "take", "stop")} if op == "otoco" else {client_id(key, s) for s in ("take", "stop")} if op == "oco" else {client_id(key)}
+            expected_ids = {client_id(key, s) for s in ("entry", "take", "stop")} if op == "otoco" else {client_id(key, s) for s in ("take", "stop")} if op == "oco" else {result.get('legacyClientOrderId', client_id(key))}
             if {o.get("clientOrderId") for o in orders} != expected_ids or any(o.get("symbol") != p["symbol"] for o in orders):
                 raise BinanceClientError("exchange order contract identifiers do not match intent")
             if any(o.get("side") != ("BUY" if op == "otoco" and o["clientOrderId"] == client_id(key, "entry") else "SELL") for o in orders):
@@ -419,30 +491,13 @@ class ExecutionService:
             for order in orders:
                 if number(order.get("executedQty", "0"), zero=True):
                     await self.apply_order_fills(intent, order)
-            protected = False
-            hazard = False
-            if op == "otoco":
-                entry = next((o for o in orders if o["clientOrderId"] == client_id(key, "entry")), None)
-                exits = [o for o in orders if o["clientOrderId"] in (client_id(key, "take"), client_id(key, "stop"))]
-                if entry is None or len(exits) != 2:
-                    hazard = True
-                else:
-                    executed = number(entry["executedQty"], zero=True)
-                    protected = entry["status"] == "FILLED" and all(o["status"] == "NEW" for o in exits)
-                    if entry["status"] == "FILLED":
-                        preview = result["preview"]
-                        sellable = self.ledger.balance(intent["strategy"], preview["base"])
-                        remaining = max((number(o["origQty"]) - number(o.get("executedQty", "0"), zero=True) for o in exits), default=Decimal(0))
-                        if protected and remaining > sellable:
-                            protected = False
-                        self.ledger.db.execute("UPDATE intents SET asset=?,reserved=? WHERE id=?",
-                                               (preview["base"], str(remaining), key))
-                    hazard = executed > 0 and not protected and not any(o["status"] == "FILLED" for o in exits)
-                    if entry["status"] == "PARTIALLY_FILLED":
-                        hazard = True
-            elif op == "oco":
-                protected = len(orders) == 2 and all(o["status"] == "NEW" for o in orders)
-                hazard = not protected and not any(o["status"] == "FILLED" for o in orders)
+            protected, hazard, exposure = self.protection_evidence(intent, response, orders)
+            if op == 'otoco' and next(o for o in orders if o['clientOrderId'] == client_id(key, 'entry'))['status'] in TERMINAL:
+                self.ledger.db.execute("UPDATE intents SET asset=?,reserved=? WHERE id=?",
+                                       (result['preview']['base'], str(exposure), key))
+            if hazard:
+                from .incidents import record
+                record(self.ledger, intent, 'PROTECTION_LOST', exposure, {'orders': orders})
             if len(orders) != (3 if op == "otoco" else 2 if op == "oco" else 1):
                 raise BinanceClientError("order list child coverage incomplete")
             done = all(o["status"] in TERMINAL for o in orders)
@@ -450,7 +505,8 @@ class ExecutionService:
                 self.ledger.pause("missing or inactive protection for " + key + "; cancel entry, reconcile fills, then attach owned OCO")
             self.ledger.update(key, "RESOLVED" if done else "OPEN",
                                result={**result, "exchange": response, "orders": orders,
-                                       "protected": protected, "protectionUncertain": hazard})
+                                       "protected": protected, "protectionUncertain": hazard,
+                                       "verifiedAt": int(time.time() * 1000)})
         elif op == "cancel":
             target = await self.reconcile(p["targetIntentId"])
             if target["state"] == "RESOLVED":
@@ -458,6 +514,62 @@ class ExecutionService:
         else:
             await self.reconcile_investment(intent)
         return self.ledger.get(key)
+
+    def protection_evidence(self, intent, response, orders):
+        """Both siblings must match the persisted contract; never infer coverage by max()."""
+        op, p, key = intent['payload']['operation'], intent['payload']['params'], intent['id']
+        if op in ('order', 'legacy_order'):
+            return False, False, Decimal(0)
+        preview = intent['result']['preview']
+        step = number(next(f for f in preview['filters'] if f['filterType'] == 'LOT_SIZE')['stepSize'])
+        target = number(preview['sellableQuantity'] if op == 'otoco' else p['quantity'])
+        entry_net = Decimal(0)
+        exits_sold = Decimal(0)
+        for event in self.ledger.db.execute("SELECT detail FROM events WHERE strategy=? AND category='fill'", (intent['strategy'],)):
+            import json
+            trade = json.loads(event[0])
+            if trade.get('intentId') != key:
+                continue
+            qty = number(trade['qty'])
+            base_fee = number(trade['commission'], zero=True) if trade['commissionAsset'] == preview['base'] else Decimal(0)
+            if trade['isBuyer']:
+                entry_net += qty - base_fee
+            else:
+                exits_sold += qty + base_fee
+        remaining = max(Decimal(0), (entry_net if op == 'otoco' else target) - exits_sold)
+        exposure = (remaining / step).to_integral_value(rounding=ROUND_DOWN) * step
+        # Keep the actual remaining commitment once. Child quantities do not set it.
+        expected_remaining = max(Decimal(0), target - exits_sold)
+        contract_ok = (response.get('listClientOrderId') == client_id(key)
+                       and response.get('symbol') == p['symbol']
+                       and response.get('orderListId') is not None
+                       and len({o.get('orderId') for o in orders}) == len(orders)
+                       and all(o.get('orderListId') == response['orderListId'] for o in orders))
+        entry_ready = True
+        if op == 'otoco':
+            entry = next(o for o in orders if o['clientOrderId'] == client_id(key, 'entry'))
+            contract_ok = contract_ok and entry.get('type') == 'LIMIT' and entry.get('timeInForce') == 'GTC' and number(entry.get('price', '0'), zero=True) == number(p['price']) and number(entry['origQty']) == number(p['quantity'])
+            entry_ready = entry['status'] == 'FILLED'
+        legs = [o for o in orders if o['clientOrderId'] in (client_id(key, 'take'), client_id(key, 'stop'))]
+        for leg in legs:
+            take = leg['clientOrderId'] == client_id(key, 'take')
+            contract_ok = contract_ok and leg.get('type') == ('LIMIT_MAKER' if take else 'STOP_LOSS')
+            contract_ok = contract_ok and number(leg.get('price' if take else 'stopPrice', '0'), zero=True) == number(p['takeProfit' if take else 'stopPrice'])
+            contract_ok = contract_ok and number(leg['origQty']) == target
+            contract_ok = contract_ok and number(leg['executedQty'], zero=True) <= number(leg['origQty'])
+        # An exit execution cancels its sibling. Remaining exposure then needs
+        # explicit recovery; a partial take is not equivalent to a stop.
+        protected = (contract_ok and entry_ready and len(legs) == 2
+                     and all(o['status'] == 'NEW' and number(o['executedQty'], zero=True) == 0
+                             and number(o['origQty']) == expected_remaining for o in legs)
+                     and expected_remaining <= exposure
+                     and exposure - expected_remaining < step)
+        # A cancelled partial entry may leave exposure even with all children terminal.
+        hazard = remaining >= step and not protected
+        if not contract_ok:
+            hazard = True
+            protected = False
+        return protected, hazard, exposure
 
     async def apply_order_fills(self, intent: dict, order: dict) -> None:
         rows = []
@@ -474,7 +586,15 @@ class ExecutionService:
         if sum((number(t["qty"]) for t in rows), Decimal(0)) != number(order["executedQty"], zero=True):
             raise BinanceClientError("fill history not yet complete")
         preview = intent["result"]["preview"]
+        if len({str(t['id']) for t in rows}) != len(rows) or any(t.get('isBuyer') is not (order['side'] == 'BUY') for t in rows):
+            raise BinanceClientError('fill identity/side evidence contradictory')
+        baseline = (intent['result'] or {}).get('legacyBaselineTrades', {})
         for trade in rows:
+            prior = baseline.get(str(trade['id']))
+            if prior is not None:
+                if self.ledger.fingerprint(trade) != self.ledger.fingerprint(prior):
+                    raise BinanceClientError('legacy historical fill evidence changed')
+                continue
             self.apply_fill(intent, trade, preview)
 
     def apply_fill(self, intent: dict, trade: dict, preview: dict, *, paper: bool = False) -> None:
@@ -483,9 +603,13 @@ class ExecutionService:
         fee_asset = trade["commissionAsset"]
         key = ("paper:" if paper else "trade:") + preview["params"]["symbol"] + ":" + str(trade["id"])
         with self.ledger.transaction():
-            if not self.ledger.event(key, strategy, "fill", base, qty, detail=trade):
+            if not self.ledger.event(key, strategy, "fill", base, qty, detail={**trade, "intentId": intent["id"]}):
                 return
             buy = trade["isBuyer"]
+            bound = number(preview['feeRateBound'], zero=True)
+            fee_basis = qty if fee_asset == base else proceeds
+            if commission and fee_asset in (base, quote) and commission > fee_basis * bound:
+                raise BinanceClientError('charged commission exceeds verified bound; owner accounting required', blocker='FEE_RATE_CHANGED', outcome_unknown=True)
             fee_quote = commission if fee_asset == quote else commission * number(trade["price"]) if fee_asset == base else Decimal(0)
             if commission and fee_asset not in (base, quote):
                 raise BinanceClientError("third-asset commission requires owned fee reserve and valuation; paused")
@@ -593,7 +717,6 @@ class ExecutionService:
             if backing < required:
                 raise BinanceClientError("strategy capital is not backed at its recorded Spot location")
         except (BinanceClientError, KeyError, TypeError, AttributeError) as exc:
-            self.ledger.pause("account location ownership requires reconciliation")
             if isinstance(exc, BinanceClientError):
                 raise
             raise BinanceClientError("Spot ownership coverage incomplete") from exc
@@ -637,6 +760,10 @@ class ExecutionService:
         ids = set()
         for row in self.ledger.db.execute("SELECT id FROM intents"):
             ids.update(client_id(row[0], suffix) for suffix in ("", "entry", "take", "stop"))
+            imported = self.ledger.get(row[0])
+            legacy_id = (imported['result'] or {}).get('legacyClientOrderId')
+            if legacy_id:
+                ids.add(legacy_id)
         if any(o.get("clientOrderId") not in ids for o in snapshot["coverage"]["orders"]["data"]):
             self.ledger.pause("unmanaged open orders require reconciliation")
             raise BinanceClientError("unmanaged open orders")
@@ -747,6 +874,8 @@ class ExecutionService:
         self.ledger.set_meta("paperPause:" + strategy, None)
 
     async def check_protection(self) -> None:
+        if any(i['state'] in ('PREPARED', 'OUTCOME_UNKNOWN') for i in self.ledger.outstanding(live_only=True)):
+            raise BinanceClientError('protection cannot be established with unknown execution', blocker='EXECUTION_UNCERTAIN')
         for strategy in self.ledger.db.execute("SELECT id,quote FROM strategies WHERE mode='live'").fetchall():
             balances = self.ledger.db.execute("SELECT asset,quantity FROM balances WHERE strategy=? AND location='SPOT' AND asset!=?",
                                               (strategy["id"], strategy["quote"])).fetchall()
@@ -763,11 +892,17 @@ class ExecutionService:
                     lot = next((f for f in preview.get("filters", []) if f["filterType"] == "LOT_SIZE"), None)
                     if lot:
                         step = number(lot["stepSize"])
-                    if result.get("protected") and not result.get("protectionUncertain"):
+                    verified = result.get('verifiedAt', 0)
+                    if result.get("protected") and not result.get("protectionUncertain") and 0 <= int(time.time()*1000) - verified <= 90000:
                         covered += number(intent["reserved"], zero=True)
                 if step is None:
                     info = await self.symbol(row["asset"] + strategy["quote"])
                     step = number(next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")["stepSize"])
                 if Decimal(row["quantity"]) - covered >= step:
                     self.ledger.pause("unprotected owned quantity for " + strategy["id"] + ":" + row["asset"])
+                    from .incidents import record
+                    record(self.ledger, {'id': 'unprotected:' + strategy['id'] + ':' + row['asset'], 'strategy': strategy['id']},
+                           'UNATTRIBUTED_PROTECTION_LOSS', Decimal(row['quantity']) - covered,
+                           {'asset': row['asset'], 'requiresOwnerAttribution': True})
                     raise BinanceClientError("unprotected owned quantity")
+        self.ledger.set_meta('protectionAt', int(time.time() * 1000))

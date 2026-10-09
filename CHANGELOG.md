@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.3.0
+
+- Verify each OCO/OTOCO child against the persisted identity, list, side, type, price/trigger, status and actual fee-adjusted exposure. Keep mutually exclusive reservations single-counted.
+- Evaluate fresh symbol permission sets with AND across sets and OR within each set. Retain a documented literal-SPOT fallback only when the field is omitted.
+- Make preview/status truly passive; split explicit accounting/control reconciliation into `binance_execution_reconcile`.
+- Reject contradictory DI product IDs while retaining exact verification for API versions omitting that field.
+- Add durable, deduplicated operator incidents, acknowledgment/delivery state, deadlines and owner-approved cancel/reconcile/owned-OCO recovery. Ambiguity never authorizes resubmission; expired/crossed/below-minimum recovery requires the operator.
+- Enforce immutable owner-approved risk policy and atomic position/value/downside/loss controls. Live entries require an operational policy/channel; no pilot settings or funding are installed automatically.
+- Add passive owner migration planning on a read-only ledger, evidence-backed legacy GTC SELL imports preserving historical IDs/remaining commitments, backups and exact revision checks. Unsupported legacy actions remain blocked.
+- Expose passive fee compatibility; BNB discounts remain unsupported and settings are never changed. Unexpected assets/rate increases fail closed.
+- Add structured sanitized MCP errors, runtime/schema identity, explicitly scoped coverage/freshness and a passive post-deployment smoke script.
+- Breaking: `binance_execution_status` no longer reconciles. Use `binance_execution_reconcile` explicitly. Live funding alone no longer enables new risk.
+
 ## 0.2.0
 
 - Require fresh aggregate Spot backing across live strategies, including profit reserves, before recovery SELL/OCO submission; cancellation remains available during ownership pauses.

@@ -13,13 +13,15 @@ from .client import BinanceClientError
 
 
 class Monitor:
-    def __init__(self, execution, interval: float = 30):
+    def __init__(self, execution, interval: float = 30, incident_sink=None):
         if not 5 <= interval <= 60:
             raise ValueError("monitor interval must be 5..60 seconds")
         self.execution = execution
         self.interval = interval
         self.wake = asyncio.Event()
         self.tasks = []
+        self.incident_sink = incident_sink
+        execution.incident_sink_configured = incident_sink is not None
 
     async def start(self):
         ledger = self.execution.ledger
@@ -44,6 +46,36 @@ class Monitor:
         self.execution.ledger.set_meta("monitorAt", None)
 
     async def tick(self):
+        from .incidents import deliver, recover, rows, record
+        ledger = self.execution.ledger
+        prior_pause = ledger.meta('pause')
+        operational = ('monitor starting', 'user stream', 'missing or inactive protection', 'unprotected owned',
+                       'reconciliation incomplete', 'uncertain execution', 'account coverage incomplete')
+        ledger.set_meta("heartbeatAt", int(time.time() * 1000))
+        try:
+            await self._tick()
+        except Exception:
+            # Tick failures have an operator incident even when no order is known.
+            synthetic = {"id": "operational-monitor", "strategy": "installation"}
+            record(ledger, synthetic, "MONITOR_FAILURE", 0, {})
+            raise
+        finally:
+            if prior_pause and not prior_pause.startswith(operational):
+                ledger.pause(prior_pause)
+            # Execution owns its lock. Recovery must run outside the monitor lock.
+            await recover(self.execution)
+            await deliver(ledger, self.incident_sink)
+        for incident in rows(ledger, active=True):
+            if incident['source'] == 'operational-monitor':
+                from .incidents import update
+                update(ledger, incident, 'RESOLVED', resolution='SUCCESSFUL_MONITOR_TICK')
+        # Incidents resolved during this successful tick no longer block the
+        # operational pause. Owner/account-policy pauses remain untouched.
+        reason = ledger.meta('pause') or ''
+        if reason.startswith(operational) and not rows(ledger, active=True) and ledger.meta('streamConnected') and ledger.meta('monitorAt') and ledger.meta('protectionAt') and not any(i['state'] in ('PREPARED','OUTCOME_UNKNOWN') for i in ledger.outstanding(live_only=True)):
+            ledger.set_meta('pause', None)
+
+    async def _tick(self):
         svc, ledger = self.execution, self.execution.ledger
         async with svc.lock:
             live_failures = []
@@ -56,6 +88,8 @@ class Monitor:
                     else:
                         live_failures.append(intent["id"])
                         ledger.pause("reconciliation incomplete for " + intent["id"])
+                        from .incidents import record
+                        record(ledger, intent, "RECONCILIATION_FAILED", intent['reserved'], {})
             if live_failures:
                 # Stored protection is historical evidence, not a successful query in
                 # this tick. Preserve the last successful monitor timestamp and pause.
@@ -71,7 +105,9 @@ class Monitor:
                            for i in ledger.outstanding(live_only=True)):
                     reason = ledger.meta("pause") or ""
                     # Only transient operational pauses may clear automatically.
-                    if reason.startswith(("monitor starting", "user stream", "missing or inactive protection", "unprotected owned", "reconciliation incomplete", "uncertain execution", "account coverage incomplete")):
+                    from .incidents import rows
+                    active_orders = [i for i in rows(ledger, active=True) if i['source'] != 'operational-monitor']
+                    if not active_orders and reason.startswith(("monitor starting", "user stream", "missing or inactive protection", "unprotected owned", "reconciliation incomplete", "uncertain execution", "account coverage incomplete")):
                         ledger.set_meta("pause", None)
             ledger.set_meta("monitorAt", int(time.time() * 1000))
 

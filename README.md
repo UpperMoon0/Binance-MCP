@@ -39,7 +39,7 @@ A live deployment can provision independent locations:
 }
 ```
 
-These are examples, not automatic allocations. Live allocations must be backed at the configured account location. Existing allocation policies are immutable across restarts. All worker processes must use the same durable SQLite file. Run **one ASGI worker** so the account stream, monitor and execution coordinator have one owner. Multiple ledger connections still enforce atomic reservations; multiple independent monitoring workers are not supported.
+These are examples, not automatic allocations. Live allocations must be backed at the configured account location. Existing allocation policies are immutable across restarts. Live entries also require a separately approved complete risk policy, bounded recovery policy, and configured incident receiver; the funding-only examples above cannot activate live trading. All worker processes must use the same durable SQLite file. Run **one ASGI worker** so the account stream, monitor and execution coordinator have one owner. Multiple ledger connections still enforce atomic reservations; multiple independent monitoring workers are not supported.
 
 Existing accounts must be reconciled before enabling live mode. Keep trading disabled while importing owner-reviewed accounting evidence. Never delete the ledger to recover a timeout or to reset the budget.
 
@@ -51,7 +51,10 @@ Existing accounts must be reconciled before enabling live mode. Keep trading dis
 | `binance_account_request` | Signed GET-only account reads |
 | `binance_trade_preview` | Current entry/exit filters, fee bounds, spread, slippage, permissions and available strategy capital |
 | `binance_strategy_execution` | Narrow `otoco`, `oco`, `order`, or `cancel` workflows |
-| `binance_execution_status` | Reconcile the original journal intent without sending another exchange write |
+| `binance_execution_status` | Passive persisted journal inspection; no reconciliation or control changes |
+| `binance_execution_reconcile` | Explicit local accounting/control reconciliation from history; no exchange write |
+| `binance_readiness` | Passive runtime/schema identity, provisioned strategies, freshness and structured blockers |
+| `binance_fee_compatibility` | Fresh passive account/symbol fee-mode inspection |
 | `binance_strategy_status` | Cash, ownership, commitments, categorized P&L, unrealized valuation and monitor status |
 | `binance_portfolio_snapshot` | Spot, Flexible Earn, DI, open orders, linked lists and reservations with coverage/timestamps |
 | `binance_market_scan` | Closed candles, volume, volatility, spread and optional shortlisted depth |
@@ -89,14 +92,14 @@ OTOCO uses a LIMIT BUY entry, a fee-adjusted LIMIT_MAKER take-profit and a STOP_
 OTOCO acceptance **does not mean a partial entry is protected**. Pending exits activate only after the working order fully fills. Reconciliation verifies each child by its stable client ID and books actual trade history/commissions exactly once. Partial fills, rejected/pending exits, history gaps and insufficient sellable quantity pause entries. To repair a partial entry:
 
 1. Cancel its list using `operation=cancel`, `params={"targetIntentId":"original-entry-intent"}` and a new recovery intent.
-2. Reconcile until every child is terminal and all fills are accounted for.
+2. Call `binance_execution_reconcile` until every child is terminal and all fills are accounted for. `binance_execution_status` only inspects stored evidence.
 3. Preview and submit an owned `oco` using the fee-adjusted quantity from strategy accounting and current exit prices.
 
 Cancellation, owned OCO repairs and owned LIMIT SELL exits remain available while entries are paused. A replacement cannot reserve quantities still committed to the previous list. There is no blind cancel/replace retry. A step-size remainder is reported as owned dust; it is not labelled protected or counted as available quote cash.
 
 STOP_LOSS exits are market orders after activation. A future gap can exceed the preview's current spread/slippage; the preview cannot guarantee a future execution price. Paper mode uses the adverse stop outcome if both exit levels occur in the same candle.
 
-Live fee payments in a third asset (for example BNB discount) are refused at preflight. Disable that discount in Binance for managed trading; an unexpected third-asset commission during reconciliation pauses accounting instead of charging an unrelated portfolio. Live runtime validation is still required before funding an experiment.
+Live fee payments in a third asset (for example BNB discount) are refused at preflight. Account discount configuration requires separate owner approval; the service never changes it. Current compatible mode is base/quote fees only; an unexpected third-asset commission during reconciliation pauses accounting instead of charging an unrelated portfolio. Live runtime validation is still required before funding an experiment.
 
 ### Uncertain writes and DI verification
 
@@ -104,7 +107,7 @@ Transport failures, timeouts, server errors and non-authoritative error response
 
 Flexible Earn subscriptions preflight the live product catalog, so a first subscription or rotation does not require an existing account position. Metadata must confirm a matching asset, purchasable status, availability and the minimum/start-time guards. Redemptions still require an owned redeemable position. Exchange history verifies `SUCCESS` for subscriptions and `PAID` for completed redemptions, including partial Earn-to-DI recovery.
 
-DI verification requires an acceptable `PURCHASE_SUCCESS` status, the returned position ID when present, a newly visible position excluded from the pre-request position set, and matching deposit, assets, direction, strike, APR, settlement and compounding plan. Numeric decimals are compared numerically. All pages are read within a bounded limit; incomplete or repeated pagination fails closed. Binance's explicit `NULL` plan is normalized as no compounding; a missing plan is not proof.
+DI verification requires an acceptable `PURCHASE_SUCCESS` status, the returned position ID when present, a newly visible position excluded from the pre-request position set, and matching deposit, assets, direction, strike, APR, settlement and compounding plan. When a position exposes `productId`, it must match the intended product; an omitted/null field uses the remaining exact contract evidence. Numeric decimals are compared numerically. All pages are read within a bounded limit; incomplete or repeated pagination fails closed. Binance's explicit `NULL` plan is normalized as no compounding; a missing plan is not proof.
 
 An advertised pagination total remains required on later pages even if they omit it. Empty pages before that total, changing totals, or excess records report incomplete coverage rather than publishing partial holdings as complete.
 
@@ -114,7 +117,7 @@ The Earn-to-DI workflow preserves `preserveEarnAmount`, verifies Spot receipt an
 
 The app lifespan starts a small monitor independently of any research cycle. It subscribes to Binance's signed `userDataStream.subscribe.signature` WebSocket API, reacts to account/order/list events and reconciles with REST every 30 seconds (configurable 5..60). It synchronizes server time, detects outside activity, verifies protection, and checks account coverage. Stream disconnects, stale monitor state over 90 seconds and unresolved executions block entries. Recovery never resends a financial write.
 
-The monitor clears only operational pauses after all corresponding checks pass. A reconciliation failure anywhere in the live tick retains the pause and last successful monitor timestamp, even if the journal previously recorded active protective orders. Outside/manual account changes, rewards and DI settlement mismatches require an attributed owner audit. Health and strategy status expose readiness; transport/authentication health alone does not imply funds are reconciled or an entry is protected.
+The monitor clears only operational pauses after all corresponding checks pass. A reconciliation failure anywhere in the live tick retains the pause and last successful monitor timestamp, even if the journal previously recorded active protective orders. Outside/manual account changes, rewards and DI settlement mismatches require an attributed owner audit. `binance_readiness` exposes scoped readiness and runtime/schema identity; transport/authentication health alone does not imply funds are reconciled or an entry is protected.
 
 ### Accounting audits
 
@@ -183,7 +186,7 @@ docker run --rm -p 8080:8080 --env-file .env -v binance-data:/app/data binance-m
 
 Persist `/app/data` for both OAuth grants and the execution ledger. Mount asymmetric private keys read-only. SQLite state contains financial history and must receive appropriate owner-only filesystem access and backups.
 
-Tests use fake exchanges/HTTP transports only; they never place live Binance orders. See [CHANGELOG.md](CHANGELOG.md) for the 0.2 migration.
+Tests use fake exchanges/HTTP transports only; they never place live Binance orders. The test harness clears Binance credentials, isolates server imports into a temporary ledger and blocks network connections. See [CHANGELOG.md](CHANGELOG.md) for compatibility changes and [Readiness contracts](docs/readiness.md) for the 0.3 migration.
 
 ## API references
 

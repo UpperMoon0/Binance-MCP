@@ -10,7 +10,10 @@ from mcp.server.transport_security import TransportSecuritySettings
 from mcp.types import ToolAnnotations
 from pydantic import Field
 
-from .client import BinanceClient, Scalar
+from .client import BinanceClient, BinanceClientError, Scalar
+from .diagnostics import rpc_guard, readiness
+from . import fees
+from .incidents import configured_sink
 from .config import Product
 from .execution import ExecutionService
 from .ledger import Ledger
@@ -25,7 +28,7 @@ investment = InvestmentService(client)
 ledger = Ledger(os.getenv("BINANCE_LEDGER_PATH", "data/strategy.sqlite"),
                 json.loads(os.getenv("BINANCE_STRATEGIES", "{}")))
 execution = ExecutionService(client, ledger, [s.strip() for s in os.getenv("BINANCE_APPROVED_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()])
-monitor = Monitor(execution, float(os.getenv("BINANCE_MONITOR_INTERVAL_SECONDS", "30")))
+monitor = Monitor(execution, float(os.getenv("BINANCE_MONITOR_INTERVAL_SECONDS", "30")), incident_sink=configured_sink())
 server = MCPServer(
     "Binance MCP",
     instructions=(
@@ -56,6 +59,7 @@ def _transport_security() -> TransportSecuritySettings:
     description="GET any public Binance REST endpoint across Spot, USDⓈ-M Futures, COIN-M Futures, Options, or Portfolio Margin. Full external URLs are rejected.",
     annotations=READ_ONLY,
 )
+@rpc_guard
 async def binance_public_request(
     product: Annotated[Product, Field(description="spot, usds_futures, coin_futures, options, or portfolio_margin")],
     path: Annotated[str, Field(description="API path such as /api/v3/ticker/price")],
@@ -69,6 +73,7 @@ async def binance_public_request(
     description="GET a signed account endpoint using server-side Binance credentials. Read-only transport: no orders, transfers, or withdrawals.",
     annotations=READ_ONLY,
 )
+@rpc_guard
 async def binance_account_request(
     product: Annotated[Product, Field(description="Binance product API host, including portfolio_margin for papi.binance.com")],
     path: Annotated[str, Field(description="Signed GET endpoint path such as /api/v3/account or /papi/v1/account")],
@@ -82,6 +87,7 @@ async def binance_account_request(
     description="Create a strategy-owned Spot LIMIT SELL or cancel a recorded intent using targetIntentId. BUY entries use binance_strategy_execution with otoco. Requires BINANCE_TRADING_ENABLED=true and a trade-enabled API key. Portfolio Margin uses multiple distinct order families and is intentionally not routed through this generic order tool. Withdrawals are not supported.",
     annotations=WRITE,
 )
+@rpc_guard
 async def binance_order_request(
     product: Annotated[Literal["spot"], Field(description="Managed Spot trading only")],
     action: Annotated[Literal["create", "cancel"], Field(description="Order action")],
@@ -100,6 +106,7 @@ async def binance_order_request(
     description="Subscribe strategy-owned Spot funds into one Simple Earn Flexible product with automatic subscription disabled. Financial write action; requires BINANCE_TRADING_ENABLED=true. Credentials and signatures stay server-side.",
     annotations=WRITE,
 )
+@rpc_guard
 async def binance_simple_earn_subscribe(
     productId: Annotated[str, Field(description="Simple Earn Flexible product id, for example USD1001")],
     amount: Annotated[str, Field(description="Positive decimal amount to subscribe")],
@@ -118,6 +125,7 @@ async def binance_simple_earn_subscribe(
     description="Redeem a strategy-owned Simple Earn Flexible amount to Spot. Financial write action; requires BINANCE_TRADING_ENABLED=true. Credentials and signatures stay server-side.",
     annotations=WRITE,
 )
+@rpc_guard
 async def binance_simple_earn_redeem(
     productId: Annotated[str, Field(description="Simple Earn Flexible product id, for example USDT001")],
     amount: Annotated[str, Field(description="Positive decimal amount to redeem")],
@@ -135,6 +143,7 @@ async def binance_simple_earn_redeem(
     description="Subscribe Spot funds into one exact Dual Investment product after re-fetching it and applying optional APR and strike-distance guards. Financial write action; requires BINANCE_TRADING_ENABLED=true. autoCompoundPlan defaults to NONE.",
     annotations=WRITE,
 )
+@rpc_guard
 async def binance_dual_investment_subscribe(
     productId: Annotated[str, Field(description="Exact Dual Investment product id from the live product list")],
     investCoin: Annotated[str, Field(description="Asset deposited into the product, e.g. USDT for Buy Low BTC")],
@@ -163,6 +172,7 @@ async def binance_dual_investment_subscribe(
     description="Read and normalize current Dual Investment positions. Signed read-only endpoint.",
     annotations=READ_ONLY,
 )
+@rpc_guard
 async def binance_dual_investment_positions(
     status: Annotated[
         str | None,
@@ -179,6 +189,7 @@ async def binance_dual_investment_positions(
     description="Safely orchestrate Flexible Earn redemption to Spot and subscription into one exact Dual Investment product while preserving a configured Earn balance. Re-checks the product after redemption and leaves funds in Spot rather than substituting another product if guards fail. Financial write action; requires BINANCE_TRADING_ENABLED=true.",
     annotations=WRITE,
 )
+@rpc_guard
 async def binance_dual_investment_from_flexible_earn(
     earnProductId: Annotated[str, Field(description="Simple Earn Flexible product id, e.g. USDT001")],
     dualProductId: Annotated[str, Field(description="Exact Dual Investment product id")],
@@ -210,48 +221,85 @@ async def binance_dual_investment_from_flexible_earn(
     description="Show redacted server-side Binance account signing/trading capability. Never returns credentials.",
     annotations=READ_ONLY,
 )
+@rpc_guard
 async def binance_auth_status() -> dict:
     return client.auth_status()
 
 
 @server.tool(title="Strategy trade preview", annotations=READ_ONLY,
              description="Validate protected Spot entry/exit against live filters, fees, spread, account permissions and strategy capital. Execution revalidates.")
+@rpc_guard
 async def binance_trade_preview(strategyId: str, operation: Literal["order", "oco", "otoco"], params: dict[str, Scalar]) -> dict:
     return await execution.preview(strategyId, operation, params)
 
 
 @server.tool(title="Strategy execution", annotations=WRITE,
              description="Persistent budgeted workflow: OTOCO limit BUY with fee-adjusted exits, owned SELL OCO, limit SELL, or linked cancellation. Never retries uncertain writes. Params for entry: symbol, quantity, price, takeProfit, stopPrice. Cancel: targetIntentId.")
+@rpc_guard
 async def binance_strategy_execution(strategyId: str, intentId: str,
                                      operation: Literal["order", "oco", "otoco", "cancel"], params: dict[str, Scalar]) -> dict:
     return await execution.execute(strategyId, intentId, operation, params)
 
 
-@server.tool(title="Execution reconciliation", annotations=READ_ONLY,
-             description="Query original intent and exchange history without resubmitting. Updates local journal/accounting only.")
+@server.tool(title="Persisted execution status", annotations=READ_ONLY,
+             description="Passive persisted intent/journal inspection. Never reconciles, reserves, pauses or submits. Unknown IDs return structured errors.")
+@rpc_guard
 async def binance_execution_status(intentId: str) -> dict:
+    intent = ledger.get(intentId)
+    if intent is None:
+        raise BinanceClientError('intent not found', blocker='INTENT_NOT_FOUND')
+    return intent
+
+
+@server.tool(title="Explicit local reconciliation", annotations=WRITE,
+             description="Update local accounting/control state from exchange history. No exchange writes or automatic recovery. Reuses the recorded intent; unknown IDs do not pause anything.")
+@rpc_guard
+async def binance_execution_reconcile(intentId: str) -> dict:
     async with execution.lock:
+        if ledger.get(intentId) is None:
+            raise BinanceClientError('intent not found', blocker='INTENT_NOT_FOUND')
         try:
             return await execution.reconcile(intentId)
         except Exception:
-            ledger.pause("reconciliation incomplete for " + intentId)
+            ledger.pause('reconciliation incomplete for ' + intentId)
             raise
+
+
+@server.tool(title="Passive connector readiness", annotations=READ_ONLY,
+             description="Inspect runtime/schema identity, provisioned strategies, scoped readiness, monitor freshness and blockers. Optional bounded fresh exchange reads; never provisions or reconciles.")
+@rpc_guard
+async def binance_readiness(checkExchange: bool = False) -> dict:
+    return await readiness(execution, monitor, await server.list_tools(), check_exchange=checkExchange)
+
+
+@server.tool(title="Passive fee compatibility", annotations=READ_ONLY,
+             description="Fresh account/symbol commission and discount compatibility. No fee-asset acquisition or discount-setting changes. Third-asset fees remain unsupported.")
+@rpc_guard
+async def binance_fee_compatibility(symbol: str) -> dict:
+    await execution.symbol(symbol)
+    commission = await client.signed_get('spot', '/api/v3/account/commission', {'symbol': symbol})
+    if commission.get('symbol') not in (None, symbol):
+        raise BinanceClientError('commission symbol contradicts request', blocker='FEE_EVIDENCE')
+    return {**fees.inspect(commission), 'symbol': symbol, 'observedAt': int(time.time()*1000)}
 
 
 @server.tool(title="Unified portfolio snapshot", annotations=READ_ONLY,
              description="Spot, Flexible Earn, Dual Investment, orders, linked lists and shared reservations with observation times and explicit missing coverage. LD receipt assets are excluded from underlying totals.")
+@rpc_guard
 async def binance_portfolio_snapshot() -> dict:
     return await execution.snapshots.portfolio()
 
 
 @server.tool(title="Bounded market scan", annotations=READ_ONLY,
              description="Approved universe, up to 20 symbols: closed candle structure, volume, volatility, spread and raw observations. Depth fetched only for at most five shortlisted symbols. No news scraping or executable research instructions.")
+@rpc_guard
 async def binance_market_scan(symbols: list[str], shortlist: list[str] | None = None) -> dict:
     return await execution.snapshots.market(symbols, shortlist)
 
 
 @server.tool(title="Strategy accounting and monitor status", annotations=READ_ONLY,
              description="Owned capital, reservations, categorized realized results/commissions, unrealized quote valuation, paper state and operational monitor freshness.")
+@rpc_guard
 async def binance_strategy_status(strategyId: str) -> dict:
     cfg = ledger.strategy(strategyId)
     assets = {r[0] for r in ledger.db.execute("SELECT asset FROM balances WHERE strategy=? AND asset!=?", (strategyId, cfg["quote"]))}

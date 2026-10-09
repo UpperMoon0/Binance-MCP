@@ -39,6 +39,15 @@ async def test_post_redemption_read_rejection_survives_restart(tmp_path, accepte
     svc.check_account = AsyncMock()
     svc.check_protection = AsyncMock()
     ledger.set_meta('monitorAt', int(time.time() * 1000))
+    ledger.set_meta('protectionAt', int(time.time() * 1000))
+    from test_execution import setup
+    fixture_ledger, _, _ = setup(tmp_path / 'fixture')
+    fixture_policy = fixture_ledger.meta('riskPolicy:experiment')
+    fixture_policy.update(maxPositionQuote='1000', maxPlannedDownsideQuote='1000')
+    ledger.set_meta('riskPolicy:experiment', fixture_policy)
+    ledger.set_meta('recoveryPolicy:experiment', fixture_ledger.meta('recoveryPolicy:experiment'))
+    svc.incident_sink_configured = True
+    fixture_ledger.db.close()
     ledger.set_meta('streamConnected', True)
     p = {'earnProductId': 'USDT001', 'dualProductId': '2650584', 'optionType': 'PUT', 'exercisedCoin': 'BTC', 'investCoin': 'USDT', 'amount': '700', 'preserveEarnAmount': '0'}
     result = await svc.execute('experiment', 'saga', 'earn_to_dual', p)
