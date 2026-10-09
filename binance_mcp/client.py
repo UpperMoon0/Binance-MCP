@@ -28,13 +28,14 @@ Scalar = str | int | float | bool
 class BinanceClientError(RuntimeError):
     def __init__(self, message: str, *, status: int | None = None, code: int | None = None,
                  retry_after: float | None = None, outcome_unknown: bool = False,
-                 headers: dict[str, str] | None = None):
+                 headers: dict[str, str] | None = None, blocker: str | None = None):
         super().__init__(message)
         self.status = status
         self.code = code
         self.retry_after = retry_after
         self.outcome_unknown = outcome_unknown
         self.headers = headers or {}
+        self.blocker = blocker
 
     @property
     def definitive_rejection(self) -> bool:
@@ -48,6 +49,7 @@ class BinanceClientError(RuntimeError):
 
     def metadata(self) -> dict[str, Any]:
         return {"message": str(self), "status": self.status, "code": self.code,
+                "blocker": self.blocker,
                 "retryAfter": self.retry_after, "outcomeUnknown": self.outcome_unknown,
                 "rateLimitHeaders": self.headers}
 

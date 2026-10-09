@@ -302,6 +302,10 @@ class InvestmentService:
                 continue
             if str(position.get("orderId")) != str(product.get("orderId")):
                 continue
+            # Some API revisions omit this field. An exposed identity must agree;
+            # orderId and matching economic terms cannot override a contradiction.
+            if position.get("productId") is not None and str(position["productId"]).strip() != str(product.get("id")).strip():
+                continue
             if position.get("status") != "PURCHASE_SUCCESS":
                 continue
             if any(str(position.get(field, "")).upper() != str(product.get(field, "")).upper()

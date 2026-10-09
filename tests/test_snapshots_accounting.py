@@ -41,8 +41,10 @@ async def test_snapshot_receipts_are_not_double_counted_and_failures_are_explici
 @pytest.mark.asyncio
 async def test_market_scan_closed_observations_approved_universe_and_shortlist(tmp_path):
     _, exchange, svc = setup(tmp_path)
-    exchange.candles = [[0, "100", "110", "90", "100", "2", 1, "200"],
-                        [2, "100", "110", "90", "110", "3", 3, "330"],
+    import time
+    t = int(time.time()*1000) - 7200000
+    exchange.candles = [[t, "100", "110", "90", "100", "2", t+3599999, "200"],
+                        [t+3600000, "100", "110", "90", "110", "3", t+7199999, "330"],
                         [9999999999999, "100", "110", "90", "999", "1", 99999999999999, "1"]]
     result = await svc.snapshots.market(["BTCUSDT"], ["BTCUSDT"])
     row = result["symbols"][0]

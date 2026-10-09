@@ -23,7 +23,7 @@ class Exchange:
         self.account = {"canTrade": True, "permissions": ["SPOT"], "balances": [
             {"asset": "USDT", "free": "1000", "locked": "0"}, {"asset": "BTC", "free": "10", "locked": "0"}]}
         self.info = {"symbol": "BTCUSDT", "baseAsset": "BTC", "quoteAsset": "USDT", "status": "TRADING",
-            "isSpotTradingAllowed": True, "ocoAllowed": True, "otoAllowed": True,
+            "permissionSets": [["SPOT"]], "isSpotTradingAllowed": True, "ocoAllowed": True, "otoAllowed": True,
             "filters": [{"filterType": "LOT_SIZE", "minQty": "0.001", "maxQty": "100", "stepSize": "0.001"},
                         {"filterType": "PRICE_FILTER", "minPrice": "0.01", "maxPrice": "100000", "tickSize": "0.01"},
                         {"filterType": "MIN_NOTIONAL", "minNotional": "5"}]}
@@ -52,8 +52,8 @@ class Exchange:
         if path == "/api/v3/account":
             return self.account
         if path == "/api/v3/account/commission":
-            return {k: {"maker": rate, "taker": rate, "buyer": "0", "seller": "0"}
-                    for k, rate in (("standardCommission", "0.001"), ("taxCommission", "0"), ("specialCommission", "0"))}
+            return {"discount": {"enabledForAccount": False, "enabledForSymbol": False}, **{k: {"maker": rate, "taker": rate, "buyer": "0", "seller": "0"}
+                    for k, rate in (("standardCommission", "0.001"), ("taxCommission", "0"), ("specialCommission", "0"))}}
         if path in ("/api/v3/openOrders", "/api/v3/openOrderList"):
             return []
         if path == "/sapi/v1/simple-earn/flexible/position":
@@ -63,7 +63,7 @@ class Exchange:
         if path == "/api/v3/orderList":
             if not self.orders:
                 raise BinanceClientError("order not visible", status=400, code=-2013)
-            return {"orders": [{"symbol": "BTCUSDT", "orderId": key} for key in self.orders]}
+            return {"orderListId": 1, "symbol": "BTCUSDT", "listClientOrderId": params["origClientOrderId"], "orders": [{"symbol": "BTCUSDT", "orderId": key} for key in self.orders]}
         if path == "/api/v3/order":
             return self.orders[params["orderId"]]
         if path == "/api/v3/myTrades":
@@ -78,10 +78,17 @@ class Exchange:
 
 
 def setup(tmp_path, mode="paper", reinvest=True):
-    ledger = Ledger(str(tmp_path / "ledger.sqlite"), {"experiment": {"allocation": "100", "mode": mode, "reinvest": reinvest}})
+    ledger = Ledger(str(tmp_path / "ledger.sqlite"), {"experiment": {"allocation": "100", "mode": mode, "reinvest": reinvest,
+        "recoveryPolicy": {"version": 1, "approved": True, "action": "operator_only", "maxDelayMs": 30000},
+        "riskPolicy": {"version": 1, "approved": True, "operations": ['otoco', 'oco', 'order', 'cancel', 'earn_subscribe', 'earn_redeem', 'dual_subscribe', 'earn_to_dual'],
+                       "assets": ['BTC', 'ETH', 'USDT'], "maxPositions": 10, "maxPositionQuote": "100",
+                       "maxPlannedDownsideQuote": "100", "lossPauseQuote": "100",
+                       "executionAllowanceBps": "10", "valuationMaxAgeMs": 90000}}})
     exchange = Exchange()
     execution = ExecutionService(exchange, ledger, ["BTCUSDT", "ETHUSDT"])
+    execution.incident_sink_configured = True
     ledger.set_meta("monitorAt", int(time.time()*1000))
+    ledger.set_meta("protectionAt", int(time.time()*1000))
     ledger.set_meta("streamConnected", True)
     return ledger, exchange, execution
 
@@ -93,11 +100,11 @@ def plan(**changes):
 def orders_for(key, status="NEW", qty="0", exits="PENDING_NEW"):
     return {
         1: {"symbol": "BTCUSDT", "orderId": 1, "clientOrderId": client_id(key, "entry"), "status": status,
-            "origQty": "0.5", "executedQty": qty, "side": "BUY", "type": "LIMIT"},
+            "origQty": "0.5", "executedQty": qty, "side": "BUY", "type": "LIMIT", "price": "100", "timeInForce": "GTC", "orderListId": 1},
         2: {"symbol": "BTCUSDT", "orderId": 2, "clientOrderId": client_id(key, "take"), "status": exits,
-            "origQty": "0.499", "executedQty": "0", "side": "SELL", "type": "LIMIT_MAKER"},
+            "origQty": "0.499", "executedQty": "0", "side": "SELL", "type": "LIMIT_MAKER", "price": "110", "orderListId": 1},
         3: {"symbol": "BTCUSDT", "orderId": 3, "clientOrderId": client_id(key, "stop"), "status": exits,
-            "origQty": "0.499", "executedQty": "0", "side": "SELL", "type": "STOP_LOSS"},
+            "origQty": "0.499", "executedQty": "0", "side": "SELL", "type": "STOP_LOSS", "stopPrice": "95", "orderListId": 1},
     }
 
 
@@ -210,12 +217,13 @@ async def test_full_entry_requires_active_fee_adjusted_exits(tmp_path):
 @pytest.mark.asyncio
 async def test_stale_monitor_and_manual_activity_pause_entries(tmp_path):
     ledger, exchange, svc = setup(tmp_path, "live")
-    ledger.set_meta("monitorAt", 1)
+    ledger.set_meta("protectionAt", 1)
     with pytest.raises(BinanceClientError, match="stale"):
         await svc.execute("experiment", "x", "otoco", plan())
     assert not exchange.writes
     ledger.set_meta("pause", None)
     ledger.set_meta("monitorAt", int(time.time()*1000))
+    ledger.set_meta("protectionAt", int(time.time()*1000))
     await svc.check_account()
     exchange.account["balances"][0]["free"] = "999"
     with pytest.raises(BinanceClientError, match="differs"):
