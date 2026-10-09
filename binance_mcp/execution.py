@@ -286,11 +286,12 @@ class ExecutionService:
                         response = await self.investment_write(operation, params)
                     finally:
                         self.investment.checkpoint = lambda phase, data: None
-                checkpoint_data = (self.ledger.get(intent_id)["result"] or {}).get("checkpoint", {})
+                progress = self.ledger.get(intent_id)["result"] or {}
+                checkpoint_data = progress.get("checkpoint", {})
                 state = "OPEN" if operation in ("order", "oco", "otoco", "cancel") else "OUTCOME_UNKNOWN"
                 if operation == "dual_subscribe" and response.get("outcome") == "REJECTED":
                     state = "REJECTED"
-                self.ledger.update(intent_id, state, result={"preview": preview, "response": response,
+                self.ledger.update(intent_id, state, result={**progress, "preview": preview, "response": response,
                                                             "path": path, "order": order, "checkpoint": checkpoint_data})
                 if operation == "cancel":
                     target = await self.reconcile(params["targetIntentId"])
@@ -302,7 +303,10 @@ class ExecutionService:
             except Exception as exc:
                 rejected = isinstance(exc, BinanceClientError) and exc.definitive_rejection
                 current = self.ledger.get(intent_id)
-                if current["state"] != "PREPARED":
+                # A rejection of a later request cannot undo an accepted saga step.
+                # Keep its checkpoint and reservation until history verifies ownership.
+                progress = current["result"] or {}
+                if current["state"] != "PREPARED" or progress.get("checkpoint", {}).get("redeemResponse") is not None:
                     rejected = False
                 self.ledger.update(intent_id, "REJECTED" if rejected else "OUTCOME_UNKNOWN", result=current["result"],
                                    error=exc.metadata() if isinstance(exc, BinanceClientError) else {"message": "execution interrupted"})
@@ -646,12 +650,21 @@ class ExecutionService:
             elif op == "order" and high >= number(p["price"]):
                 fill_price = number(p["price"])
             elif not buy and op in ("oco", "otoco"):
-                if low <= number(p["stopPrice"]):
+                active_leg = result.get("activeExitLeg")
+                if result.get("paperStatus") == "EXIT_PARTIALLY_FILLED" and active_leg is None:
+                    raise BinanceClientError("paper partial exit lacks active leg; reconciliation required")
+                if active_leg == "stop":
+                    # An activated STOP_LOSS remains a market order after a partial fill.
+                    fill_price = number(c[1])
+                elif active_leg is None and low <= number(p["stopPrice"]):
+                    result["activeExitLeg"] = "stop"
                     fill_price = min(number(p["stopPrice"]), number(c[1]))
-                elif high >= number(p["takeProfit"]):
+                elif active_leg in (None, "take") and high >= number(p["takeProfit"]):
                     fill_price = number(p["takeProfit"])
             with self.ledger.transaction():
                 if fill_price is not None and capacity:
+                    if not buy and op in ("oco", "otoco") and not result.get("activeExitLeg"):
+                        result["activeExitLeg"] = "take"
                     field = "entryFilled" if buy else "exitFilled"
                     filled = number(result.get(field, "0"), zero=True)
                     target = number(p["quantity"] if buy or op != "otoco" else preview["sellableQuantity"])
@@ -671,6 +684,8 @@ class ExecutionService:
                             self.clear_paper_pause_if_protected(intent["strategy"])
                             # Entry/stop ordering is unknowable within a candle; model adverse stop
                             # on the newly activated full entry if that candle crosses the stop.
+                            if low <= number(p["stopPrice"]):
+                                result["activeExitLeg"] = "stop"
                             if low <= number(p["stopPrice"]) and capacity - qty >= number(preview["sellableQuantity"]):
                                 exit_qty = number(preview["sellableQuantity"])
                                 stop = min(number(p["stopPrice"]), number(c[1]))
@@ -679,6 +694,7 @@ class ExecutionService:
                                               "commission": str(exit_qty * stop * number(preview["feeRateBound"], zero=True)),
                                               "commissionAsset": preview["quote"], "isBuyer": False}
                                 self.apply_fill(intent, exit_trade, preview, paper=True)
+                                result["activeExitLeg"] = "stop"
                                 result["paperStatus"], result["protected"] = "FILLED", False
                         else:
                             self.ledger.set_meta("paperPause:" + intent["strategy"], "partial entry has inactive exits; cancel and protect owned quantity")

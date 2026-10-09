@@ -8,6 +8,8 @@ Every financial write requires `strategyId` and a stable `intentId`. The allocat
 
 Reservations are shared by ordinary Spot orders, linked orders, Flexible Earn subscriptions/redemptions, and Dual Investment. Amounts use decimal arithmetic. An intent and its complete contract are committed before the exchange request. The Earn-to-DI saga checkpoints its redemption and refreshed DI contract before each write. A repeated intent with the same contract reconciles the original; a different contract is rejected.
 
+After a redemption is accepted, a later read rejection retains the saga checkpoint and reservation. Recovery verifies the unique PAID redemption history and Spot receipt before moving ownership; it never repeats the redemption automatically. A definitive rejection of the first write can release its reservation.
+
 Capital is tracked by strategy, asset and location (`SPOT`, `EARN:productId`, `DI:positionId`, `PROFIT_RESERVE`). Configure separate allocations for an experiment, conservative holdings and an ETH buyback reserve. One strategy cannot sell or redeem another strategy's holdings. The ledger is not a lifetime turnover counter.
 
 ### Configuration
@@ -102,6 +104,8 @@ Flexible Earn subscriptions preflight the live product catalog, so a first subsc
 
 DI verification requires an acceptable `PURCHASE_SUCCESS` status, the returned position ID when present, a newly visible position excluded from the pre-request position set, and matching deposit, assets, direction, strike, APR, settlement and compounding plan. Numeric decimals are compared numerically. All pages are read within a bounded limit; incomplete or repeated pagination fails closed. Binance's explicit `NULL` plan is normalized as no compounding; a missing plan is not proof.
 
+An advertised pagination total remains required on later pages even if they omit it. Empty pages before that total, changing totals, or excess records report incomplete coverage rather than publishing partial holdings as complete.
+
 The Earn-to-DI workflow preserves `preserveEarnAmount`, verifies Spot receipt and re-fetches the same product after redemption. If the DI request then times out, the result never claims the pre-request Spot balance is verified. Exact recovery uses DI positions and Earn history; ambiguous records without a unique write identifier require owner reconciliation. A safe partial completion leaves the funds owned by the same strategy, never spends them as another strategy's cash.
 
 ### Operational monitoring
@@ -142,7 +146,7 @@ P&L separates these categories from fill/realized/commission events. Realized P&
 
 ### Paper mode
 
-Paper Spot strategies use the same symbol/filter, sizing, reservation, intent and lifecycle rules, with simulated 0.1% undiscounted fees. They need no Binance signing credentials, send no exchange writes, and never connect to an authenticated user stream. New LIMIT orders wait for subsequent closed one-minute candle evidence. Entry fees reduce sellable quantity; exits book actual simulated proceeds and losses. Both-level candles take the adverse stop outcome, gap stops use the worse open, and missing candle coverage leaves the intent unresolved. Simulated fills are capped at 10% of candle base volume and rounded to the quantity step; thin-volume entries remain partial and cannot be labelled protected. Paper mode is a conservative candle simulation, not an order-book queue simulator. Investment settlement simulation is unsupported; investment calls fail closed in paper mode.
+Paper Spot strategies use the same symbol/filter, sizing, reservation, intent and lifecycle rules, with simulated 0.1% undiscounted fees. They need no Binance signing credentials, send no exchange writes, and never connect to an authenticated user stream. New LIMIT orders wait for subsequent closed one-minute candle evidence. Entry fees reduce sellable quantity; exits book actual simulated proceeds and losses. Both-level candles take the adverse stop outcome, gap stops use the worse open, and missing candle coverage leaves the intent unresolved. Simulated fills are capped at 10% of candle base volume and rounded to the quantity step; thin-volume entries remain partial and cannot be labelled protected. The first take-profit fill or stop activation persists the active exit leg and cancels its sibling across restarts. Remaining take-profit quantity waits for its limit; remaining activated stop quantity trades at subsequent candle opens. Legacy partial exits without a recorded active leg require reconciliation and cannot resume automatic fills. Paper mode is a conservative candle simulation, not an order-book queue simulator. Investment settlement simulation is unsupported; investment calls fail closed in paper mode.
 
 ### Semantic snapshots and research boundary
 

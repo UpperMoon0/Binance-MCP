@@ -9,6 +9,7 @@ from typing import Any
 from .client import BinanceClientError
 from .investment import InvestmentService
 from .ledger import number
+from .pagination import Coverage
 
 
 class Snapshots:
@@ -19,19 +20,20 @@ class Snapshots:
                     size_key: str = "size", extra: dict | None = None) -> list[dict]:
         collected = []
         seen = set()
+        coverage = Coverage()
         for page in range(1, 101):
             data = await self.client.signed_get("spot", path, {**(extra or {}), page_key: page, size_key: 100})
             if not isinstance(data, dict) or rows not in data:
                 raise BinanceClientError("unexpected paginated response; coverage incomplete")
             batch = data[rows]
+            if not isinstance(batch, list):
+                raise BinanceClientError("unexpected page rows; coverage incomplete")
             signature = repr(batch)
             if batch and signature in seen:
                 raise BinanceClientError("pagination repeated; coverage incomplete")
             seen.add(signature)
             collected.extend(batch)
-            if not batch or ("total" in data and len(collected) >= int(data["total"])) or (
-                "total" not in data and len(batch) < 100
-            ):
+            if coverage.complete(data.get("total"), len(collected), len(batch)):
                 return collected
         raise BinanceClientError("pagination limit exceeded; coverage incomplete")
 

@@ -5,6 +5,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
 from .client import BinanceClient, BinanceClientError
+from .pagination import Coverage
 
 OptionType = Literal["PUT", "CALL"]
 AutoCompoundPlan = Literal["NONE", "STANDARD", "ADVANCED"]
@@ -271,6 +272,7 @@ class InvestmentService:
         }
 
     async def all_positions(self) -> list[dict[str, Any]]:
+        coverage = Coverage()
         rows: list[dict[str, Any]] = []
         seen: set[str] = set()
         for page in range(1, 101):
@@ -282,7 +284,7 @@ class InvestmentService:
             seen.update(identifiers)
             rows.extend(batch)
             total = result["total"]
-            if not batch or (total is not None and len(rows) >= int(total)) or (total is None and len(batch) < 100):
+            if coverage.complete(total, len(rows), len(batch)):
                 return rows
         raise BinanceClientError("Dual Investment pagination limit reached; coverage incomplete")
 
