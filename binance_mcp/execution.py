@@ -223,11 +223,22 @@ class ExecutionService:
                 "protection": "PENDING_FULL_FILL" if operation == "otoco" else "REQUIRES_RECONCILIATION"}
         policy.authorize(self.ledger, strategy, operation, [info['baseAsset'], info['quoteAsset']])
         if operation == 'otoco' and self.ledger.meta('riskPolicy:' + strategy):
-            prices = {}
+            prices, exit_fees = {}, {}
             for row in self.ledger.db.execute("SELECT DISTINCT asset FROM balances WHERE strategy=? AND asset!=? AND quantity!='0'", (strategy, cfg['quote'])):
                 observation = await self.client.public_get('spot', '/api/v3/ticker/bookTicker', {'symbol': row['asset'] + cfg['quote']})
                 prices[row['asset']] = str(number(observation['bidPrice']))
-            result['riskEvidence'] = {'observedAt': started_at, 'prices': prices}
+                held_symbol = row['asset'] + cfg['quote']
+                if cfg['mode'] == 'paper':
+                    exit_fees[row['asset']] = '0.001'
+                else:
+                    held_commission = await self.client.signed_get('spot', '/api/v3/account/commission', {'symbol': held_symbol})
+                    if not isinstance(held_commission, dict) or held_commission.get('symbol') not in (None, held_symbol):
+                        raise BinanceClientError('commission symbol contradicts holding', blocker='FEE_EVIDENCE')
+                    compatible = fees.inspect(held_commission)
+                    if not compatible['compatible']:
+                        raise BinanceClientError('holding exit fee mode unsupported', blocker='UNSUPPORTED_FEE_ASSET')
+                    exit_fees[row['asset']] = compatible['feeRateBound']
+            result['riskEvidence'] = {'observedAt': started_at, 'prices': prices, 'exitFeeRates': exit_fees}
             policy.entry_check(self.ledger, strategy, result)
         return result
 

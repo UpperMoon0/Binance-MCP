@@ -2,6 +2,7 @@
 
 ## 0.3.0
 
+- Address PR #16 review: validate replacement feasibility before canceling protection, preserve owner halts and fingerprint all safety state during migration, price holding exit fees per symbol, and permit asyncio loopback IPC in the isolated network guard.
 - Verify each OCO/OTOCO child against the persisted identity, list, side, type, price/trigger, status and actual fee-adjusted exposure. Keep mutually exclusive reservations single-counted.
 - Evaluate fresh symbol permission sets with AND across sets and OR within each set. Retain a documented literal-SPOT fallback only when the field is omitted.
 - Make preview/status truly passive; split explicit accounting/control reconciliation into `binance_execution_reconcile`.

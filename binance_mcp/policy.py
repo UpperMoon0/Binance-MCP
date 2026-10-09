@@ -59,11 +59,20 @@ def entry_check(ledger, strategy, preview, *, persist_loss=False):
     realized = Decimal(report['resultsByCategory'].get('realized', '0')) + Decimal(report['resultsByCategory'].get('loss', '0'))
     # Cost bases and realized P&L already include charged commissions. Reserve
     # conservative exit costs on unrealized assets; deposits/rewards are excluded.
-    marked = sum((number(b['quantity'], zero=True) * number(risk['prices'][b['asset']])
-                  for b in report['balances'] if b['asset'] != report['strategy']['quote'] and number(b['quantity'], zero=True)), Decimal(0))
     fee = number(preview['feeRateBound'], zero=True)
     allowance = number(policy['executionAllowanceBps'], zero=True) / 10000
-    pnl = realized + Decimal(report['unrealizedQuote']) - marked * (fee + allowance)
+    exit_cost = Decimal(0)
+    for balance in report['balances']:
+        if balance['asset'] == report['strategy']['quote'] or not number(balance['quantity'], zero=True):
+            continue
+        rate = risk.get('exitFeeRates', {}).get(balance['asset'])
+        if rate is None:
+            raise BinanceClientError('fresh holding exit fee required', blocker='FEE_EVIDENCE')
+        rate = number(rate, zero=True)
+        if rate >= 1:
+            raise BinanceClientError('invalid holding exit fee', blocker='FEE_EVIDENCE')
+        exit_cost += number(balance['quantity'], zero=True) * number(risk['prices'][balance['asset']]) * (rate + allowance)
+    pnl = realized + Decimal(report['unrealizedQuote']) - exit_cost
     if -pnl >= number(policy['lossPauseQuote']):
         if persist_loss:
             ledger.set_meta('riskPause:' + strategy, {'code': 'LOSS_PAUSED', 'observedAt': now, 'pnlQuote': str(pnl)})

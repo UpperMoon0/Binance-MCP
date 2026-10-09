@@ -80,7 +80,7 @@ def apply_audit(ledger: Ledger, audit: dict, observed_totals: dict[str, str]) ->
             raise BinanceClientError("attributed strategy ownership exceeds exchange capital")
         ledger.set_meta("expectedTotals", {a: str(v) for a, v in candidate.items()})
         ledger.set_meta(key, digest)
-        ledger.pause("monitor starting; owner audit imported, protection and account checks required")
+        ledger.pause(ledger.meta("pause") or "monitor starting; owner audit imported, protection and account checks required")
     return {"id": audit["id"], "alreadyApplied": False}
 
 

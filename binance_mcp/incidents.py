@@ -63,6 +63,30 @@ async def deliver(ledger, sink):
                deliveryAttempts=d['deliveryAttempts'] + 1, deliveredAt=int(time.time()*1000) if acknowledged is True else None)
 
 
+async def replacement_preflight(svc, source):
+    """Prove current replacement feasibility without releasing real protection.
+
+    Release only this intent's local reservation in a disposable ledger. Exchange
+    free capital and order limits receive no speculative cancellation credit;
+    uncertain/locked capital therefore requires operator intervention.
+    """
+    from .ledger import Ledger
+    from .execution import ExecutionService
+    _, _, quantity = svc.protection_evidence(source, source['result']['exchange'], source['result']['orders'])
+    lot = number(next(f for f in source['result']['preview']['filters'] if f['filterType'] == 'LOT_SIZE')['stepSize'])
+    quantity = (quantity / lot).to_integral_value(rounding=ROUND_DOWN) * lot
+    if not quantity:
+        raise BinanceClientError('no replaceable exposure', blocker='RESIDUAL_DUST_OPERATOR_REQUIRED')
+    clone = Ledger(':memory:')
+    try:
+        svc.ledger.db.backup(clone.db)
+        clone.update(source['id'], 'RESOLVED', result=source['result'])
+        candidate = ExecutionService(svc.client, clone, svc.snapshots.symbols)
+        await candidate.preview(source['strategy'], 'oco', {**source['payload']['params'], 'quantity': str(quantity)})
+    finally:
+        clone.db.close()
+
+
 async def recover(svc):
     ledger = svc.ledger
     for incident in rows(ledger, active=True):
@@ -101,6 +125,14 @@ async def recover(svc):
             if (source['result'] or {}).get('protected') and not (source['result'] or {}).get('protectionUncertain'):
                 update(ledger, incident, 'RESOLVED', resolution='ORIGINAL_PROTECTION_VERIFIED')
                 continue
+            # A failed feasibility check must leave the original list untouched.
+            # Repeat execution preflight after cancellation for fills/market races.
+            if ledger.get(d['cancelIntentId']) is None:
+                async with svc.lock:
+                    await replacement_preflight(svc, source)
+                if int(time.time()*1000) >= d['deadline']:
+                    update(ledger, incident, 'ESCALATED', deadlineExceeded=True)
+                    continue
             update(ledger, incident, 'CANCELING')
             cancel = await svc.execute(incident['strategy'], d['cancelIntentId'], 'cancel', {'targetIntentId': source['id']})
             if cancel['state'] != 'RESOLVED':

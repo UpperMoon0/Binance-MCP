@@ -12,8 +12,7 @@ COMPATIBILITY = {'legacy_limit_sell_gtc': 'IMPORTABLE_WITH_COST_BASIS', 'legacy_
 
 def revision(ledger):
     data = {table: [tuple(r) for r in ledger.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
-            for table in ('strategies', 'balances', 'intents', 'events')}
-    data['policies'] = [tuple(r) for r in ledger.db.execute("SELECT * FROM meta WHERE key LIKE '%Policy:%' OR key='expectedTotals' OR key LIKE 'audit:%' ORDER BY key")]
+            for table in ('strategies', 'balances', 'intents', 'events', 'incidents', 'meta')}
     return Ledger.fingerprint(data)
 
 

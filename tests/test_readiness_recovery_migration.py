@@ -78,7 +78,7 @@ async def test_crossed_stop_recovery_escalates_without_liquidation(tmp_path):
     install_recovery_exchange(ex)
     ex.book.update(bidPrice='90',askPrice='90.01')
     await incidents.recover(svc)
-    assert len(ex.writes)==2  # entry and cancellation only
+    assert len(ex.writes)==1  # failed preflight preserves the original list
     assert incidents.rows(ledger)[0]['state']=='BLOCKED'
     assert ledger.balance('experiment','BTC')==Decimal('.1998')
 
@@ -200,3 +200,78 @@ async def test_readonly_migration_connection_has_zero_database_writes(tmp_path):
     assert persistent_state(ledger)==before
     with pytest.raises(Exception): readonly.pause('forbidden')
     readonly.db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('failure', ['crossed', 'notional', 'permissions', 'fees', 'free', 'orders'])
+async def test_failed_replacement_preflight_preserves_working_stop(tmp_path, failure):
+    ledger, ex, svc = setup(tmp_path, 'live')
+    ledger.set_meta('recoveryPolicy:experiment', {'version': 1, 'approved': True, 'action': 'cancel_attach', 'maxDelayMs': 30000})
+    ex.orders = orders_for('damaged', 'FILLED', '.5', 'NEW')
+    ex.orders[2]['price'] = '111'  # invalid take; stop is still valid and active
+    ex.fills = {1: [fill()]}
+    await svc.execute('experiment', 'damaged', 'otoco', plan())
+    install_recovery_exchange(ex)
+    if failure == 'crossed':
+        ex.book.update(bidPrice='90', askPrice='90.01')
+    elif failure == 'notional':
+        ex.info['filters'][2]['minNotional'] = '50'
+    elif failure == 'permissions':
+        ex.account['canTrade'] = False
+    elif failure == 'free':
+        ex.account['balances'][1].update(free='0', locked='10')
+    elif failure == 'orders':
+        ex.info['filters'].append({'filterType': 'MAX_NUM_ORDERS', 'maxNumOrders': 1})
+    else:
+        original = ex.signed_get
+        async def signed(product, path, params=None):
+            result = await original(product, path, params)
+            if path == '/api/v3/account/commission':
+                result['discount'].update(enabledForAccount=True, enabledForSymbol=True)
+            return result
+        ex.signed_get = signed
+    before = copy.deepcopy(ex.orders[3])
+    await incidents.recover(svc)
+    assert len(ex.writes) == 1
+    assert ex.orders[3] == before and ex.orders[3]['status'] == 'NEW'
+    assert incidents.rows(ledger)[0]['state'] == 'BLOCKED'
+    assert ledger.balance('experiment', 'BTC') == Decimal('.4995')
+    assert ledger.get('damaged')['state'] == 'OPEN'
+    assert ledger.get(incidents.rows(ledger)[0]['detail']['cancelIntentId']) is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('control', ['pause', 'riskPause:experiment', 'streamConnected', 'incident'])
+async def test_migration_rejects_safety_change_since_plan(tmp_path, control):
+    ledger, ex, svc, audit, snapshot = await legacy_fixture(tmp_path)
+    assert migration.plan(ledger, snapshot, audit)['canApply']
+    previous = migration.revision(ledger)
+    if control == 'incident':
+        ledger.db.execute("INSERT INTO incidents VALUES('new','source','experiment','DETECTED',1,'{}')")
+    else:
+        ledger.set_meta(control, 'OWNER_EMERGENCY_HALT')
+    assert migration.revision(ledger) != previous
+    before = persistent_state(ledger)
+    assert not migration.plan(ledger, snapshot, audit)['canApply']
+    with pytest.raises(BinanceClientError, match='revision changed'):
+        migration.apply(ledger, snapshot, audit, str(tmp_path / 'stale-backup.sqlite'))
+    assert persistent_state(ledger) == before
+
+
+@pytest.mark.asyncio
+async def test_fresh_migration_audit_preserves_owner_emergency_halt(tmp_path):
+    ledger, ex, svc, audit, snapshot = await legacy_fixture(tmp_path)
+    ledger.pause('OWNER_EMERGENCY_HALT')
+    audit['ledgerRevision'] = migration.revision(ledger)
+    assert migration.plan(ledger, snapshot, audit)['canApply']
+    migration.apply(ledger, snapshot, audit, str(tmp_path / 'halt-backup.sqlite'))
+    assert ledger.meta('pause') == 'OWNER_EMERGENCY_HALT'
+
+
+def test_direct_accounting_audit_preserves_owner_pause(tmp_path):
+    from binance_mcp.accounting import apply_audit
+    ledger, _, _ = setup(tmp_path, 'live')
+    ledger.set_meta('expectedTotals', {'USDT': '100'})
+    ledger.pause('OWNER_EMERGENCY_HALT')
+    apply_audit(ledger, {'id': 'halt-audit', 'evidence': ['owner']}, {'USDT': '100'})
+    assert ledger.meta('pause') == 'OWNER_EMERGENCY_HALT'

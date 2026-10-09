@@ -278,3 +278,76 @@ def test_null_permission_sets_and_wrong_account_type_fail_closed():
     assert not spot_permissions({'canTrade':True,'permissions':['SPOT']},{'permissionSets':None})
     assert not spot_permissions({'canTrade':True,'permissions':['SPOT'],'accountType':'MARGIN'},{'permissionSets':[['SPOT']]})
     assert spot_permissions({'canTrade':True,'permissions':['SPOT']},{})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('fee_mode', ['high', 'missing', 'discount', 'wrong_symbol'])
+async def test_mixed_symbol_holdings_use_fresh_exit_fees(tmp_path, fee_mode):
+    ledger, ex, svc = setup(tmp_path, 'live')
+    cfg = ledger.meta('riskPolicy:experiment')
+    cfg['lossPauseQuote'] = '.5'
+    ledger.set_meta('riskPolicy:experiment', cfg)
+    ledger.change('experiment', 'ETH', 'SPOT', Decimal('1'), Decimal('99.99'))
+    original = ex.signed_get
+    queried = []
+    async def signed(product, path, params=None):
+        result = await original(product, path, params)
+        if path == '/api/v3/account/commission':
+            queried.append(params['symbol'])
+            result['symbol'] = params['symbol']
+            if params['symbol'] == 'ETHUSDT':
+                if fee_mode == 'high':
+                    result['standardCommission'].update(maker='.01', taker='.01')
+                elif fee_mode == 'missing':
+                    del result['taxCommission']
+                elif fee_mode == 'discount':
+                    result['discount'].update(enabledForAccount=True, enabledForSymbol=True)
+                else:
+                    result['symbol'] = 'BTCUSDT'
+        return result
+    ex.signed_get = signed
+    before = persistent_state(ledger)
+    with pytest.raises(BinanceClientError) as exc:
+        await svc.preview('experiment', 'otoco', plan())
+    assert exc.value.blocker == {'high': 'LOSS_PAUSED', 'missing': 'FEE_EVIDENCE', 'discount': 'UNSUPPORTED_FEE_ASSET', 'wrong_symbol': 'FEE_EVIDENCE'}[fee_mode]
+    assert queried == ['BTCUSDT', 'ETHUSDT']
+    assert persistent_state(ledger) == before and not ex.writes
+    if fee_mode == 'high':
+        with pytest.raises(BinanceClientError):
+            await svc.execute('experiment', 'mixed-loss', 'otoco', plan())
+        assert not ex.writes
+
+
+@pytest.mark.asyncio
+async def test_missing_exit_fee_evidence_fails_closed_in_atomic_policy_check(tmp_path):
+    ledger, _, svc = setup(tmp_path)
+    ledger.change('experiment', 'BTC', 'SPOT', Decimal('.1'), Decimal('10'))
+    preview = await svc.preview('experiment', 'otoco', plan())
+    del preview['riskEvidence']['exitFeeRates']['BTC']
+    with pytest.raises(BinanceClientError) as exc:
+        policy.entry_check(ledger, 'experiment', preview)
+    assert exc.value.blocker == 'FEE_EVIDENCE'
+
+
+@pytest.mark.asyncio
+async def test_mixed_symbol_fee_evidence_remains_distinct_and_is_used_atomically(tmp_path):
+    ledger, ex, svc = setup(tmp_path, 'live')
+    ledger.change('experiment', 'ETH', 'SPOT', Decimal('1'), Decimal('99.99'))
+    original = ex.signed_get
+    async def signed(product, path, params=None):
+        result = await original(product, path, params)
+        if path == '/api/v3/account/commission' and params['symbol'] == 'ETHUSDT':
+            result['standardCommission'].update(maker='.002', taker='.002')
+        return result
+    ex.signed_get = signed
+    preview = await svc.preview('experiment', 'otoco', plan())
+    assert preview['feeRateBound'] == '0.001'
+    assert preview['riskEvidence']['exitFeeRates'] == {'ETH': '0.002'}
+    cfg = ledger.meta('riskPolicy:experiment')
+    cfg['lossPauseQuote'] = '.25'  # ETH exit fees + allowance ~.30, BTC rate would give ~.20
+    ledger.set_meta('riskPolicy:experiment', cfg)
+    before = persistent_state(ledger)
+    with pytest.raises(BinanceClientError) as exc:
+        ledger.begin('fee-race', 'experiment', {'operation': 'otoco'}, 'USDT', 'SPOT', preview['reservation'], prepared={'preview': preview})
+    assert exc.value.blocker == 'LOSS_PAUSED'
+    assert persistent_state(ledger) == before
