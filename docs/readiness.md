@@ -31,7 +31,7 @@ Risk policy version 1 requires all fields:
 | `executionAllowanceBps` | Explicit nonnegative conservative allowance, at most 2000 |
 | `valuationMaxAgeMs` | Explicit positive valuation age bound, at most 90000 ms |
 
-New entries check policy both passively and inside SQLite's reservation transaction. Current marks are required; missing/stale marks block new risk. Loss pauses persist separately from operational pauses and do not automatically reset. Deposits, withdrawals, transfers, Earn rewards and settlements are separately categorized; they are not added to realized trading P&L. Non-quote positive owner attributions require audited receipt cost basis so receipt value is not manufactured as trading profit. Investment writes with open non-quote exposure are currently blocked until compatible trading valuation evidence is supported, rather than assigning zero exit costs. Sale proceeds can be reused subject to current limits; initial funding is not a per-run allowance or lifetime turnover cap. A stop and planned downside do not guarantee a maximum realized loss during gaps or liquidity failures.
+New entries check policy both passively and inside SQLite's reservation transaction. Current marks are required; missing/stale marks block new risk. Loss pauses persist separately from operational pauses and do not automatically reset. Deposits, withdrawals, transfers, Earn rewards and settlements are separately categorized; they are not added to realized trading P&L. Non-quote positive owner attributions require audited receipt cost basis so receipt value is not manufactured as trading profit. Investment writes with open non-quote exposure require compatible trading valuation evidence: this is implemented for explicitly owned acquired-asset Flexible Earn; other investment workflows still fail closed rather than assigning zero exit costs. Sale proceeds can be reused subject to current limits; initial funding is not a per-run allowance or lifetime turnover cap. The separately authorized buy-only mode adds a non-replenishing cumulative allowance. A stop and planned downside do not guarantee a maximum realized loss during gaps or liquidity failures.
 
 `binance_fee_compatibility` exposes current standard/tax/special rates and discount flags. Discounts enabled for account **and** symbol block submission even if BNB appears insufficient: fallback cannot safely be predicted from someone else's balance. Base/quote-only payment remains the supported mode. BNB support, acquisition, attribution and account-wide discount changes are not implemented or authorized. Execution fetches fresh fees; unknown fee assets or actual charges exceeding the verified bound retain uncertainty for owner accounting. Cost/P&L already include fees; the commission disclosure is not deducted again. Commission metadata without explicit discount evidence is blocked; symbol contradictions are rejected.
 
@@ -92,3 +92,14 @@ Readiness exposes the default ID and each budget's funding source and initial ca
 This is a persistent accounting limit on existing holdings, not an exchange
 transfer or permission to use the entire account. The funding-only configuration
 does not waive risk/recovery, stream, reconciliation, fees or protection checks.
+
+
+## Buy-only IOC and acquired-asset Earn extension (#19)
+
+New explicitly provisioned `buy_ioc` entries and acquired-base subscriptions are
+covered by [their separate contract](buy-only-ioc.md). They do not authorize imports
+of legacy IOC trades/non-quote Earn positions, conversions, automatic subscription,
+or arbitrary unprotected holdings. Legacy migration compatibility remains unchanged.
+Readiness exposes the new modes independently from `protectedLive`, retaining all
+operational blockers. Their implementation, review/merge, deployment, connector
+exposure and read-only functional validation are distinct release milestones.

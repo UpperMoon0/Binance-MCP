@@ -115,11 +115,14 @@ async def binance_simple_earn_subscribe(
     autoSubscribe: Annotated[bool, Field(description="Whether to enable automatic subscription for this product. Defaults to false.")] = False,
     sourceAccount: Annotated[Literal["SPOT"], Field(description="Managed source is SPOT only")] = "SPOT",
     *,
+    asset: Annotated[str | None, Field(description="Exact product asset; non-quote assets require verified acquired buy-and-hold ownership")] = None,
     strategyId: Annotated[str | None, Field(description="Budget ID; omit to use the owner-configured default budget")] = None,
     intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
-    return await execution.execute(strategyId, intentId, "earn_subscribe", {
-        "productId": productId, "amount": amount, "autoSubscribe": autoSubscribe, "sourceAccount": sourceAccount})
+    params = {"productId": productId, "amount": amount, "autoSubscribe": autoSubscribe, "sourceAccount": sourceAccount}
+    if asset is not None:
+        params['asset'] = asset
+    return await execution.execute(strategyId, intentId, "earn_subscribe", params)
 
 
 @server.tool(
@@ -229,16 +232,26 @@ async def binance_auth_status() -> dict:
 
 
 @server.tool(title="Strategy trade preview", annotations=READ_ONLY,
-             description="Validate protected Spot entry/exit against live filters, fees, spread, account permissions and strategy capital. Execution revalidates.")
+             description="Passive Spot validation: protected OTOCO, owned exits, or explicitly authorized unprotected buy_ioc (LIMIT BUY/IOC). buy_ioc params: symbol, quantity, price, maxQuoteSpend including fees. Execution revalidates; preview does not clear operational blockers.")
 @rpc_guard
-async def binance_trade_preview(operation: Literal["order", "oco", "otoco"], params: dict[str, Scalar], strategyId: str | None = None) -> dict:
+async def binance_trade_preview(operation: Literal["order", "oco", "otoco", "buy_ioc"], params: dict[str, Scalar], strategyId: str | None = None) -> dict:
     return await execution.preview(strategyId, operation, params)
 
 
-@server.tool(title="Strategy execution", annotations=WRITE,
-             description="Persistent budgeted workflow: OTOCO limit BUY with fee-adjusted exits, owned SELL OCO, limit SELL, or linked cancellation. Never retries uncertain writes. Params for entry: symbol, quantity, price, takeProfit, stopPrice. Cancel: targetIntentId.")
+@server.tool(title="Flexible Earn preview", annotations=READ_ONLY,
+             description="Passively validate an exact owned Flexible Earn subscription or redemption. Acquired-asset subscription params require asset, productId, amount. No redemption/purchase/subscription orchestration; a failed later step leaves verified funds at their recorded location.")
 @rpc_guard
-async def binance_strategy_execution(intentId: str, operation: Literal["order", "oco", "otoco", "cancel"],
+async def binance_earn_preview(operation: Literal["earn_subscribe", "earn_redeem"],
+                               params: dict[str, Scalar], strategyId: str | None = None) -> dict:
+    strategy = execution.resolve_strategy(strategyId)
+    preview, _, _, _ = await execution.investment_preflight(strategy, operation, params)
+    return preview
+
+
+@server.tool(title="Strategy execution", annotations=WRITE,
+             description="Persistent budgeted workflow: OTOCO limit BUY with fee-adjusted exits, owned SELL OCO, limit SELL, or linked cancellation. Never retries uncertain writes. Params for protected entry: symbol, quantity, price, takeProfit, stopPrice. Explicit buy_ioc: symbol, quantity, price, maxQuoteSpend including fees; LIMIT BUY/IOC with unprotected market exposure, no exits. Requires owner buy-and-hold policy and finite cumulative allowance. Cancel: targetIntentId.")
+@rpc_guard
+async def binance_strategy_execution(intentId: str, operation: Literal["order", "oco", "otoco", "buy_ioc", "cancel"],
                                      params: dict[str, Scalar], strategyId: str | None = None) -> dict:
     return await execution.execute(strategyId, intentId, operation, params)
 

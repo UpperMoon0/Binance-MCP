@@ -74,7 +74,7 @@ Existing accounts must be reconciled before enabling live mode. Keep trading dis
 | `binance_order_request` | Compatibility tool for guarded Spot LIMIT SELL or recorded-intent cancellation |
 | `binance_auth_status` | Redacted signing/trading capability |
 
-**Version 0.2 introduced budgeted financial calls:** stable intent IDs remain mandatory; the strategy ID may now be omitted when an owner-configured default budget exists. Derivative mutations, arbitrary order parameters, Funding-account movements, automatic Earn subscriptions and DI compounding are disabled in managed workflows. Read access remains available. Ordinary BUY orders must use protected `otoco`; individual raw stop parameters are no longer a bypass around the guarded linked workflow.
+**Version 0.2 introduced budgeted financial calls:** stable intent IDs remain mandatory; the strategy ID may now be omitted when an owner-configured default budget exists. Derivative mutations, arbitrary order parameters, Funding-account movements, automatic Earn subscriptions and DI compounding are disabled in managed workflows. Read access remains available. Ordinary BUY orders must use protected `otoco`; individual raw stop parameters are not a bypass. The separately authorized `buy_ioc` mode supports explicit unprotected buy-and-hold with its own cumulative allowance; see [its contract](docs/buy-only-ioc.md).
 
 ### Protected Spot entry example
 
@@ -210,3 +210,17 @@ Tests use fake exchanges/HTTP transports only; they never place live Binance ord
 This public repository intentionally contains no GitHub Actions workflows or production deployment configuration. NsTut's CI/CD remains in private `UpperMoon0/NsTut-CICD`; infrastructure and deployment credentials stay outside this source tree.
 
 This project is not affiliated with or endorsed by Binance.
+
+
+### Explicit buy-only IOC and acquired-asset Earn
+
+`binance_trade_preview` / `binance_strategy_execution` also expose `buy_ioc`:
+plain LIMIT BUY/IOC with explicit quantity, limit price, `maxQuoteSpend`, stable
+intent identity, owner-approved buy-and-hold mode and a separate finite cumulative
+allowance. This is unprotected market exposure; protected OTOCO behavior is unchanged.
+`binance_earn_preview` and an explicit `asset` on `binance_simple_earn_subscribe`
+support only verified acquired base holdings, with tracked location/cost and
+subsequent owned redemption. No automatic multi-step orchestration is provided.
+
+See [buy-only IOC and acquired Earn](docs/buy-only-ioc.md) for provisioning,
+accounting semantics, uncertainty handling, synthetic tests and separate release gates.

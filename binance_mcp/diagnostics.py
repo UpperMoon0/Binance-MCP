@@ -1,13 +1,14 @@
 """Safe structured MCP errors and passive readiness; never provisions or reconciles."""
 from functools import wraps
 from pathlib import Path
+from decimal import Decimal
 import hashlib
 import json
 import time
 import uuid
 from mcp.types import CallToolResult, TextContent
 from .client import BinanceClientError
-from . import incidents, policy
+from . import incidents, policy, buyhold
 
 
 def error_result(exc):
@@ -101,7 +102,31 @@ async def readiness(svc, monitor, tools, *, check_exchange=False):
         # Commission/permission checks are symbol-specific, only a preview can
         # functionally verify them immediately before submitting that contract.
         blockers.append('FRESH_TRADE_PREFLIGHT_REQUIRED')
-        strategies.append({**cfg, 'riskPolicy': risk, 'recoveryPolicy': recovery,
+        hold = ledger.meta('buyHoldPolicy:' + row['id'])
+        hold_blockers = list(blockers)
+        if hold is None:
+            hold_blockers.append('BUY_HOLD_POLICY_REQUIRED')
+        if risk is not None and 'buy_ioc' not in risk['operations']:
+            hold_blockers.append('POLICY_OPERATION')
+        remaining = buyhold.budget(ledger, row['id']) if hold is not None else None
+        if remaining is not None and Decimal(remaining['remainingQuote']) <= 0:
+            hold_blockers.append('BUYBACK_ALLOWANCE')
+        earn_blockers = list(blockers) + ['EXACT_OWNED_ASSET_PRODUCT_PREFLIGHT_REQUIRED']
+        if hold is None:
+            earn_blockers.append('BUY_HOLD_POLICY_REQUIRED')
+        earn_operations = {}
+        for operation in ('earn_subscribe', 'earn_redeem'):
+            scoped = list(earn_blockers)
+            if risk is not None and operation not in risk['operations']:
+                scoped.append('POLICY_OPERATION')
+            earn_operations[operation] = {'ready': False, 'blockers': scoped}
+        strategies.append({**cfg, 'buyHoldPolicy': hold,
+                           'buyOnlyIoc': {'implemented': True, 'ready': False, 'protected': False,
+                               'exposure': 'UNPROTECTED_BUY_AND_HOLD', 'blockers': hold_blockers, 'budget': remaining},
+                           'acquiredAssetEarn': {'implemented': True, 'ready': False,
+                               'blockers': earn_blockers, 'operations': earn_operations,
+                               'orchestration': False, 'rewardAttribution': 'OWNER_AUDITED'},
+                           'riskPolicy': risk, 'recoveryPolicy': recovery,
                            'protectedLive': {'ready': False, 'blockers': blockers},
                            'paper': {'configured': row['mode'] == 'paper', 'functionallyChecked': False}})
     observation = None

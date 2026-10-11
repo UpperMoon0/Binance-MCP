@@ -12,7 +12,7 @@ COMPATIBILITY = {'legacy_limit_sell_gtc': 'IMPORTABLE_WITH_COST_BASIS', 'legacy_
 
 def revision(ledger):
     data = {table: [tuple(r) for r in ledger.db.execute('SELECT * FROM ' + table + ' ORDER BY 1')]
-            for table in ('strategies', 'balances', 'intents', 'events', 'incidents', 'meta')}
+            for table in ('strategies', 'balances', 'buy_hold', 'intents', 'events', 'incidents', 'meta')}
     return Ledger.fingerprint(data)
 
 

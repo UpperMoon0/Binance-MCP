@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- Add explicitly authorized unprotected LIMIT BUY/IOC with a fee-inclusive request
+  cap and non-replenishing cumulative buyback allowance under existing budgets.
+- Persist intent/reservation before submission; reconcile terminal identity and
+  complete actual fills atomically, retaining uncertain commitments without retries.
+- Track acquired base ownership through explicit matching Flexible Earn subscription,
+  redemption and owner-audited rewards while preserving cost, unrelated holdings,
+  existing auto-subscription settings and all operational blockers.
+- Add passive Earn preview and scoped readiness. No policy installation, live
+  financial writes, orchestration, deployment or release-version change.
+
+
 ## 0.3.0
 
 - Address PR #16 review: validate replacement feasibility before canceling protection, preserve owner halts and fingerprint all safety state during migration, price holding exit fees per symbol, and permit asyncio loopback IPC in the isolated network guard.

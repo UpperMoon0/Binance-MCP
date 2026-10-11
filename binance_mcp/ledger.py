@@ -48,6 +48,8 @@ class Ledger:
             CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, strategy TEXT NOT NULL,
                 category TEXT NOT NULL, asset TEXT NOT NULL, amount TEXT NOT NULL,
                 quote_value TEXT NOT NULL, created INTEGER NOT NULL, detail TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS buy_hold(strategy TEXT, asset TEXT, location TEXT, quantity TEXT NOT NULL,
+                PRIMARY KEY(strategy,asset,location));
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY, source TEXT NOT NULL,
                 strategy TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL, detail TEXT NOT NULL);
@@ -98,12 +100,15 @@ class Ledger:
             # Reopening a database without configuration preserves the approved policy.
             from .policy import validate
             for key, cfg in (allocations or {}).items():
-                for field in ("riskPolicy", "recoveryPolicy"):
+                for field in ("riskPolicy", "recoveryPolicy", "buyHoldPolicy"):
                     if field not in cfg:
                         continue
                     value = cfg[field]
                     if field == "riskPolicy":
                         validate(value)
+                    elif field == "buyHoldPolicy":
+                        from .buyhold import validate as validate_buyhold
+                        validate_buyhold(value)
                     else:
                         from .incidents import validate_recovery
                         validate_recovery(value)
@@ -192,9 +197,12 @@ class Ledger:
                 if self.db.execute("SELECT 1 FROM intents i JOIN strategies s ON i.strategy=s.id "
                                    "WHERE s.mode='live' AND i.state IN ('PREPARED','OUTCOME_UNKNOWN')").fetchone():
                     raise BinanceClientError("unresolved execution blocks further expenditure")
-            if prepared and prepared.get("preview", {}).get("operation") in ("otoco", "earn_subscribe", "dual_subscribe", "earn_to_dual"):
+            if prepared and prepared.get("preview", {}).get("operation") in ("otoco", "buy_ioc", "earn_subscribe", "dual_subscribe", "earn_to_dual"):
                 from .policy import entry_check
                 entry_check(self, strategy, prepared["preview"])
+                if prepared['preview']['operation'] == 'buy_ioc':
+                    from .buyhold import check
+                    check(self, strategy, prepared['preview'])
             if self.available(strategy, asset, location) < amount_d:
                 raise BinanceClientError("insufficient available strategy capital")
             self.db.execute("INSERT INTO intents VALUES(?,?,?,?,?,?,?,?,?,?,?)",
@@ -261,7 +269,12 @@ class Ledger:
                     missing.append(row["asset"])
                 else:
                     unrealized += Decimal(row["quantity"]) * number(prices[row["asset"]]) - Decimal(row["cost"])
-        return {"strategy": cfg, "balances": balances, "events": events[-200:], "eventCount": len(events),
+        from . import buyhold
+        hold = self.meta('buyHoldPolicy:' + strategy)
+        hold_report = {'exposure': 'UNPROTECTED_BUY_AND_HOLD', 'protected': False,
+                       'budget': buyhold.budget(self, strategy),
+                       'ownedSubset': [dict(r) for r in self.db.execute('SELECT asset,location,quantity FROM buy_hold WHERE strategy=?', (strategy,))]} if hold else None
+        return {"strategy": cfg, "buyAndHold": hold_report, "balances": balances, "events": events[-200:], "eventCount": len(events),
                 "paperPauseReason": self.meta("paperPause:" + strategy),
                 "resultsByCategory": {k: str(v) for k, v in totals.items()},
                 "unrealizedQuote": str(unrealized) if not missing else None,

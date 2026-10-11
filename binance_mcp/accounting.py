@@ -12,6 +12,7 @@ from pathlib import Path
 from .client import BinanceClient, BinanceClientError
 from .execution import ExecutionService
 from .ledger import Ledger, number
+from . import buyhold
 
 CATEGORIES = {"deposit", "withdrawal", "earn_reward", "settlement", "commission", "loss", "transfer"}
 
@@ -61,7 +62,16 @@ def apply_audit(ledger: Ledger, audit: dict, observed_totals: dict[str, str]) ->
             quote_value = signed_decimal(adjustment.get("quoteValue", "0"))
             if adjustment['asset'] != cfg['quote'] and quantity > 0 and cost <= 0:
                 raise BinanceClientError('positive non-quote attribution needs audited receipt cost basis')
-            ledger.change(strategy, adjustment["asset"], adjustment["location"], quantity, cost)
+            asset, location = adjustment['asset'], adjustment['location']
+            attributed = buyhold.quantity(ledger, strategy, asset, location)
+            if adjustment.get('buyHoldReward') is True:
+                buyhold.authorize(ledger, strategy, asset + cfg['quote'])
+                if category != 'earn_reward' or quantity <= 0 or not location.startswith('EARN:') or attributed <= 0:
+                    raise BinanceClientError('buy-and-hold reward requires owned Earn principal and positive reward evidence')
+                buyhold.change(ledger, strategy, asset, location, quantity)
+            elif quantity < 0:
+                buyhold.change(ledger, strategy, asset, location, -min(attributed, -quantity))
+            ledger.change(strategy, asset, location, quantity, cost)
             ledger.event(key + ":" + str(index), strategy, category, adjustment["asset"], quantity, quote_value,
                          detail={"evidence": audit["evidence"], "adjustment": adjustment})
         for resolution in audit.get("resolveIntents", []):
