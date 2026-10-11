@@ -159,8 +159,13 @@ use available non-hold units first, then an exact hold portion when needed. Fres
 protection counts only that reservation's non-hold portion in addition to the full
 intentional hold subset. Disjoint protected and held inventory both count, while
 an exit attached to a hold cannot also cover unrelated inventory. Partial sells
-consume the recorded non-hold portion first and reduce only their own hold
-attribution. Earn cannot subscribe or redeem another intent's committed hold.
+consume the recorded non-hold principal first and reduce only their own hold
+attribution. Buy-and-hold budgets also reserve a separate conservative base-fee
+bucket for new SELL/OCO exits. Each partial fill releases principal and fee quota
+separately: actual base fees consume the fee bucket's attributed units, while
+quote fees release the unused base allowance. Strategy reports expose these
+`sellFeeReservations`. Older exits without that bucket can account base fees only
+from currently uncommitted units; they cannot borrow another intent's backing. Earn cannot subscribe or redeem another intent's committed hold.
 
 A generic accounting `resolveIntents` audit cannot terminate a `buy_ioc` or book
 its pending base/quote balances independently. Doing so would release the allowance
@@ -173,7 +178,7 @@ for supported base/quote commission deviations, containing:
 - no generic `adjustments` or `resolveIntents` in the same audit
 
 The existing offline audit command obtains complete read-only account totals.
-Recovery checks original order identity/contract/STP, quantities, trade identity,
+Recovery checks original order identity/contract/STP, quantities, valid unique trade IDs and each trade’s exact parent order ID,
 commission assets, quote totals and no live remainder. It books actual fills,
 commissions, quote debit, finite allowance consumption and acquired holdings
 atomically before releasing the reservation. Derived account deltas must explain
@@ -181,6 +186,30 @@ all observed totals or every table rolls back. Replaying the same audit is
 idempotent; changing its payload fails. Actual past fees can exhaust or exceed the
 allowance, but never reset it or authorize another buy. The original immutable
 request and owner pauses remain unchanged. This recovery sends no exchange write.
+
+## Owner recovery for uncertain acquired Earn transfers
+
+Generic balance adjustments plus terminal `resolveIntents` are rejected for
+outstanding acquired-asset Earn transfers, including separate adjustments that
+could be booked twice later. A standalone owner-only `earnRecoveries` audit must
+contain no generic adjustments, terminal resolutions, IOC recoveries, or account
+deltas: these are transfers of existing underlying assets, not new funding.
+Each entry contains `intentId`, `approveAttribution=true`, a fresh `observedAt`,
+and the exact exchange history `record`, including its receipt ID and `time`.
+
+The receipt must match operation-specific terminal status (SUCCESS subscription,
+PAID redemption), product, asset, amount, any exposed Spot account fields, and the
+intent's time window. A known accepted ID cannot change. Owner approval binds a
+previously unknown receipt to that intent; the shared receipt-claim journal rejects
+reuse for any other intent, including receipts already reconciled online.
+
+Recovery uses the same transactional exact transfer as normal reconciliation,
+moving the full reserved acquired subset and proportional cost between Spot and
+its exact Earn product. Identity claims, balances, cost, attribution and terminal
+state either commit together or all roll back. Replays of an identical audit are
+idempotent. Both subscription and redemption timeouts are supported without
+reissuing either exchange write. Existing pauses remain; unresolved account or
+location drift requires independent owner review.
 
 ## Readiness and release evidence
 

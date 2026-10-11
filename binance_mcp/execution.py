@@ -36,6 +36,26 @@ def client_id(intent: str, suffix: str = "") -> str:
     return "mcp_" + hashlib.sha256((intent + suffix).encode()).hexdigest()[:28]
 
 
+def exchange_id(value):
+    if type(value) is int:
+        result = value
+    elif isinstance(value, str) and value.isascii() and value.isdigit() and len(value) <= 19:
+        result = int(value)
+    else:
+        raise BinanceClientError('invalid exchange identity', blocker='FILL_EVIDENCE')
+    if not 0 <= result <= 9223372036854775807:
+        raise BinanceClientError('invalid exchange identity', blocker='FILL_EVIDENCE')
+    return str(result)
+
+
+def earn_record_id(value):
+    if type(value) is int or (isinstance(value, str) and value.isascii() and value.isdigit()):
+        return exchange_id(value)
+    if isinstance(value, str) and 0 < len(value) <= 128 and value.isascii() and all(c.isalnum() or c in '_-' for c in value):
+        return value
+    raise BinanceClientError('invalid Earn receipt identity', blocker='EARN_HISTORY_IDENTITY')
+
+
 class ExecutionService:
     def __init__(self, client, ledger: Ledger, symbols: list[str], *, incident_receiver_required: bool = True, default_strategy_id: str | None = None):
         self.client, self.ledger = client, ledger
@@ -192,10 +212,11 @@ class ExecutionService:
         reservation = qty * price * (1 + fee_rate) if side == "BUY" else qty
         if operation == "buy_ioc" and reservation > number(params["maxQuoteSpend"]):
             raise BinanceClientError("maximum quote spend including fees exceeded", blocker="QUOTE_SPEND_CAP")
-        if self.ledger.available(strategy, asset) < reservation:
+        required = reservation + (qty * fee_rate if side == 'SELL' and self.ledger.meta('buyHoldPolicy:' + strategy) else Decimal(0))
+        if self.ledger.available(strategy, asset) < required:
             raise BinanceClientError("insufficient available strategy capital")
         balances = {b["asset"]: b for b in account["balances"]}
-        if cfg["mode"] == "live" and number(balances.get(asset, {}).get("free", "0"), zero=True) < reservation:
+        if cfg["mode"] == "live" and number(balances.get(asset, {}).get("free", "0"), zero=True) < required:
             raise BinanceClientError("insufficient exchange free balance")
         for f in info["filters"]:
             if f["filterType"] == "MAX_POSITION" and side == "BUY":
@@ -649,6 +670,14 @@ class ExecutionService:
             raise BinanceClientError('IOC has no terminal evidence', blocker='IOC_NOT_TERMINAL', outcome_unknown=True)
         if not isinstance(open_orders, list) or any(o.get('clientOrderId') == client_id(key) or o.get('orderId') == order['orderId'] for o in open_orders):
             raise BinanceClientError('IOC live BUY remainder not excluded', blocker='IOC_LIVE_REMAINDER', outcome_unknown=True)
+        order_id = exchange_id(order.get('orderId'))
+        if order_id == '0':
+            raise BinanceClientError('invalid IOC order identity', blocker='FILL_EVIDENCE')
+        if not isinstance(rows, list) or any(not isinstance(t, dict) for t in rows):
+            raise BinanceClientError('invalid IOC trade evidence', blocker='FILL_EVIDENCE')
+        trade_ids = [exchange_id(t.get('id')) for t in rows]
+        if len(set(trade_ids)) != len(trade_ids) or any(exchange_id(t.get('orderId')) != order_id for t in rows):
+            raise BinanceClientError('IOC trade does not belong to terminal order', blocker='FILL_EVIDENCE')
         qty = sum((number(t['qty']) for t in rows), Decimal(0))
         spent = sum((number(t['quoteQty']) for t in rows), Decimal(0))
         if (len({str(t['id']) for t in rows}) != len(rows)
@@ -662,7 +691,7 @@ class ExecutionService:
         for trade in rows:
             price, size, proceeds = number(trade['price']), number(trade['qty']), number(trade['quoteQty'])
             commission, asset = number(trade['commission'], zero=True), trade['commissionAsset']
-            if (trade.get('isBuyer') is not True or trade.get('symbol', p['symbol']) != p['symbol']
+            if (not isinstance(asset, str) or not asset or trade.get('isBuyer') is not True or trade.get('symbol', p['symbol']) != p['symbol']
                     or price > number(p['price']) or proceeds > size * number(p['price'])
                     or (commission and asset not in (base, quote))):
                 raise BinanceClientError('IOC fill contradicts approved contract', blocker='FILL_EVIDENCE', outcome_unknown=True)
@@ -670,7 +699,7 @@ class ExecutionService:
             if audit is None and commission > basis * number(preview['feeRateBound'], zero=True):
                 raise BinanceClientError('IOC commission exceeds verified bound', blocker='FEE_RATE_CHANGED', outcome_unknown=True)
             prior = self.ledger.db.execute('SELECT strategy,detail FROM events WHERE id=?',
-                ('trade:' + p['symbol'] + ':' + str(trade['id']),)).fetchone()
+                ('trade:' + p['symbol'] + ':' + exchange_id(trade['id']),)).fetchone()
             if prior and (prior['strategy'] != intent['strategy'] or json.loads(prior['detail']) != {**trade, 'intentId': key}):
                 raise BinanceClientError('IOC trade attribution changed', blocker='FILL_EVIDENCE', outcome_unknown=True)
             commissions[asset] = commissions.get(asset, Decimal(0)) + commission
@@ -783,7 +812,7 @@ class ExecutionService:
         strategy, base, quote = intent["strategy"], preview["base"], preview["quote"]
         qty, proceeds, commission = number(trade["qty"]), number(trade["quoteQty"]), number(trade["commission"], zero=True)
         fee_asset = trade["commissionAsset"]
-        key = ("paper:" if paper else "trade:") + preview["params"]["symbol"] + ":" + str(trade["id"])
+        key = ("paper:" if paper else "trade:") + preview["params"]["symbol"] + ":" + (str(trade["id"]) if paper else exchange_id(trade["id"]))
         with self.ledger.transaction():
             if not self.ledger.event(key, strategy, "fill", base, qty, detail={**trade, "intentId": intent["id"]}):
                 return
@@ -811,10 +840,10 @@ class ExecutionService:
                 cost = Decimal(row[0]) * sold / balance
                 net = proceeds - (commission if fee_asset == quote else 0)
                 pnl = net - cost
-                self.ledger.change(strategy, base, "SPOT", -sold, -cost)
                 current = self.ledger.get(intent['id'])
                 if current['asset'] == base:
-                    buyhold.consume(self.ledger, current, sold)
+                    buyhold.consume(self.ledger, current, qty, commission if fee_asset == base else Decimal(0))
+                self.ledger.change(strategy, base, "SPOT", -sold, -cost)
                 self.ledger.change(strategy, quote, "SPOT", net)
                 self.ledger.event(key + ":pnl", strategy, "realized", quote, net, pnl)
                 if pnl > 0 and not self.ledger.strategy(strategy)["reinvest"]:
@@ -838,6 +867,7 @@ class ExecutionService:
         preview = result.get("preview", {})
         response = result.get("response", {})
         checkpoint = result.get("checkpoint", {})
+        history = None
         partial_redemption = op == "earn_to_dual" and (
             (response.get("subscribed") is False and response.get("fundsLocation") == "SPOT")
             or response.get("outcome") == "REJECTED"
@@ -847,7 +877,8 @@ class ExecutionService:
             record_id = raw.get("redeemId")
             if record_id is None:
                 raise BinanceClientError("redemption outcome unknown; unique exchange history identifier required")
-            await self.verify_earn_history(intent, "earn_redeem", p["earnProductId"], record_id)
+            record = await self.verify_earn_history(intent, "earn_redeem", p["earnProductId"], record_id)
+            history = ('earn_redeem', p['earnProductId'], record)
             if await self.investment._spot_free(intent["asset"]) < number(p["amount"]):
                 raise BinanceClientError("redeemed Spot receipt unavailable")
             destination = "SPOT"
@@ -863,9 +894,24 @@ class ExecutionService:
             record_id = raw.get("purchaseId" if op == "earn_subscribe" else "redeemId")
             if record_id is None:
                 raise BinanceClientError("Earn write identifier unavailable; operator reconciliation required")
-            await self.verify_earn_history(intent, op, p["productId"], record_id)
+            record = await self.verify_earn_history(intent, op, p["productId"], record_id)
+            history = (op, p['productId'], record)
             destination = "EARN:" + p["productId"] if op == "earn_subscribe" else "SPOT"
+        self.complete_investment_move(intent, destination, history=history)
+
+    def complete_investment_move(self, intent, destination, *, history=None):
+        p, result = intent['payload']['params'], intent['result'] or {}
+        preview = result.get('preview', {})
         with self.ledger.transaction():
+            if history is not None:
+                op, product_id, record = history
+                id_field = 'purchaseId' if op == 'earn_subscribe' else 'redeemId'
+                claim_key = 'earnHistory:' + op + ':' + earn_record_id(record.get(id_field))
+                claim = {'intentId': intent['id'], 'productId': product_id, 'asset': intent['asset'], 'amount': str(number(p['amount']))}
+                previous = self.ledger.meta(claim_key)
+                if previous is not None and previous != claim:
+                    raise BinanceClientError('Earn history already attributed to another intent', blocker='EARN_HISTORY_IDENTITY')
+                self.ledger.set_meta(claim_key, claim)
             if self.ledger.event("move:" + intent["id"], intent["strategy"], "transfer", intent["asset"], number(p["amount"]), detail={"destination": destination}):
                 amount = number(p['amount'])
                 balance = self.ledger.balance(intent['strategy'], intent['asset'], intent['location'])
@@ -878,6 +924,33 @@ class ExecutionService:
                              intent_id=intent['id'], exact=preview.get('acquiredAsset', False))
             self.ledger.update(intent["id"], "RESOLVED", result={**result, "verifiedDestination": destination, "fundsLocation": destination})
 
+    def resolve_earn_evidence(self, intent, record, *, observed_at, audit):
+        """Owner-attributed exact receipt, used only by standalone offline recovery."""
+        p, result = intent['payload']['params'], intent['result'] or {}
+        op = intent['payload']['operation']
+        preview = result.get('preview', {})
+        field = 'purchaseId' if op == 'earn_subscribe' else 'redeemId'
+        status = 'SUCCESS' if op == 'earn_subscribe' else 'PAID'
+        record_id = earn_record_id(record.get(field))
+        opposite = 'redeemId' if op == 'earn_subscribe' else 'purchaseId'
+        stamp = record.get('time')
+        if (op not in ('earn_subscribe', 'earn_redeem') or not preview.get('acquiredAsset')
+                or opposite in record or record.get('productId', record.get('projectId')) != p['productId']
+                or any(record[k] != p['productId'] for k in ('productId', 'projectId') if k in record)
+                or record.get('sourceAccount', 'SPOT') != 'SPOT' or record.get('destAccount', 'SPOT') != 'SPOT'
+                or record.get('asset') != intent['asset'] or number(record['amount']) != number(p['amount'])
+                or record.get('status') != status or type(stamp) is not int
+                or not preview['historyStart'] <= stamp <= observed_at):
+            raise BinanceClientError('Earn recovery receipt contradicts intent', blocker='EARN_HISTORY_IDENTITY')
+        known_id = result.get('response', {}).get('response', {}).get(field)
+        if known_id is not None and earn_record_id(known_id) != record_id:
+            raise BinanceClientError('Earn recovery receipt identity changed', blocker='EARN_HISTORY_IDENTITY')
+        destination = 'EARN:' + p['productId'] if op == 'earn_subscribe' else 'SPOT'
+        self.complete_investment_move(intent, destination, history=(op, p['productId'], record))
+        updated = self.ledger.get(intent['id'])
+        self.ledger.update(intent['id'], 'RESOLVED', result={**updated['result'],
+            'ownerAuditId': audit['id'], 'evidence': audit['evidence'], 'recoveredHistoryId': record_id})
+
     async def verify_earn_history(self, intent: dict, op: str, product_id: str, record_id) -> None:
         preview, p = intent["result"]["preview"], intent["payload"]["params"]
         records = await self.snapshots.pages("/sapi/v1/simple-earn/flexible/history/" + ("subscriptionRecord" if op == "earn_subscribe" else "redemptionRecord"),
@@ -889,6 +962,7 @@ class ExecutionService:
                    and number(r["amount"]) == number(p["amount"]) and r.get("status") == terminal_status]
         if len(matches) != 1:
             raise BinanceClientError("Earn history has not verified exact transfer")
+        return matches[0]
 
     async def reconcile_all(self) -> None:
         for intent in self.ledger.outstanding(live_only=True):

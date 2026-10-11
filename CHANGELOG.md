@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Second review hardening: bind audited trades to their parent order, separate
+  partial-sale principal/fee reserves, and preserve acquired Earn attribution
+  through exact owner-approved receipt recovery.
+
 - Review hardening: pin maker-preserving EXPIRE_TAKER, atomically reserve acquired
   subsets, distinguish overlapping protection, and require exact-fill IOC audit
   recovery to preserve cumulative spend and attribution.

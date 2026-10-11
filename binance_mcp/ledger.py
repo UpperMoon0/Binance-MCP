@@ -51,6 +51,8 @@ class Ledger:
             CREATE TABLE IF NOT EXISTS buy_hold(strategy TEXT, asset TEXT, location TEXT, quantity TEXT NOT NULL,
                 PRIMARY KEY(strategy,asset,location));
             CREATE TABLE IF NOT EXISTS hold_reservations(intent TEXT PRIMARY KEY, quantity TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS sell_fee_reservations(intent TEXT PRIMARY KEY, strategy TEXT, asset TEXT,
+                location TEXT, quantity TEXT NOT NULL, held TEXT NOT NULL, rate TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY, source TEXT NOT NULL,
                 strategy TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL, detail TEXT NOT NULL);
@@ -174,7 +176,11 @@ class Ledger:
         held = sum((Decimal(r[0]) for r in self.db.execute(
             "SELECT reserved FROM intents WHERE strategy=? AND asset=? AND location=? "
             "AND state NOT IN ('RESOLVED','REJECTED')", (strategy, asset, location))), Decimal(0))
-        return self.balance(strategy, asset, location) - held
+        fee_held = sum((Decimal(r[0]) for r in self.db.execute(
+            "SELECT f.quantity FROM sell_fee_reservations f JOIN intents i ON f.intent=i.id "
+            "WHERE f.strategy=? AND f.asset=? AND f.location=? AND i.state NOT IN ('RESOLVED','REJECTED')",
+            (strategy, asset, location))), Decimal(0))
+        return self.balance(strategy, asset, location) - held - fee_held
 
     def begin(self, key: str, strategy: str, payload: dict, asset: str, location: str, amount: str,
               *, recovery: bool = False, prepared: dict | None = None) -> tuple[dict, bool]:
@@ -213,6 +219,8 @@ class Ledger:
             self.db.execute("INSERT INTO intents VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                             (key, strategy, fingerprint, json.dumps(payload, sort_keys=True), "PREPARED",
                              asset, location, str(amount_d), int(time.time() * 1000), json.dumps(prepared) if prepared is not None else None, None))
+            if prepared and payload.get('operation') in ('order', 'oco') and self.meta('buyHoldPolicy:' + strategy):
+                buyhold.reserve_sell_fee(self, self.get(key), number(prepared['preview']['feeRateBound'], zero=True))
             return self.get(key), True
 
     def update(self, key: str, state: str, *, result: Any = None, error: Any = None) -> None:
@@ -279,7 +287,11 @@ class Ledger:
         hold_report = {'exposure': 'UNPROTECTED_BUY_AND_HOLD', 'protected': False,
                        'budget': buyhold.budget(self, strategy),
                        'ownedSubset': [dict(r) for r in self.db.execute('SELECT asset,location,quantity FROM buy_hold WHERE strategy=?', (strategy,))]} if hold else None
-        return {"strategy": cfg, "buyAndHold": hold_report, "balances": balances, "events": events[-200:], "eventCount": len(events),
+        return {"strategy": cfg, "buyAndHold": hold_report,
+                "sellFeeReservations": [dict(r) for r in self.db.execute(
+                    "SELECT f.intent,f.asset,f.location,f.quantity,f.held FROM sell_fee_reservations f "
+                    "JOIN intents i ON f.intent=i.id WHERE f.strategy=? AND i.state NOT IN ('RESOLVED','REJECTED')", (strategy,))],
+                "balances": balances, "events": events[-200:], "eventCount": len(events),
                 "paperPauseReason": self.meta("paperPause:" + strategy),
                 "resultsByCategory": {k: str(v) for k, v in totals.items()},
                 "unrealizedQuote": str(unrealized) if not missing else None,
