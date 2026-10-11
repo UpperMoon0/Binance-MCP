@@ -86,7 +86,7 @@ async def readiness(svc, monitor, tools, *, check_exchange=False):
     if active:
         global_blockers.append('OPERATOR_INCIDENT_UNRESOLVED')
     for row in ledger.db.execute('SELECT id,mode FROM strategies'):
-        cfg = dict(row)
+        cfg = {**dict(row), **ledger.strategy(row["id"])}
         blockers = list(global_blockers)
         risk = ledger.meta('riskPolicy:' + row['id'])
         if risk is None:
@@ -121,6 +121,7 @@ async def readiness(svc, monitor, tools, *, check_exchange=False):
             'verification': {'implemented': True, 'runtimePackageFilesIdentified': True, 'loadedCodeAttestation': False,
                              'connectorExposure': 'VERIFY_CLIENT_DISCOVERY', 'financialWriteSmokeTest': False},
             'strategies': strategies, 'provisioned': bool(strategies),
+            'defaultStrategyId': getattr(svc, 'default_strategy_id', None),
             'monitor': {k: ledger.meta(k) for k in ('heartbeatAt', 'monitorAt', 'reconciledAt', 'protectionAt', 'streamConnected', 'lastUserEventAt')},
             'incidentNotifications': {'required': svc.incident_receiver_required,
                                       'configured': monitor.incident_sink is not None,

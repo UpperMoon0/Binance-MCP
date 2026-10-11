@@ -83,3 +83,12 @@ python scripts/readiness_smoke.py https://your-approved-host/mcp/
 ```
 
 This lists actual schemas, checks passive annotations and calls passive readiness with fresh bounded reads. It prints a sanitized scoped result, source/schema identity and blockers. It does not allocate, place test orders, reconcile, reconnect/redeploy, change settings/schedules or send notifications. Confirm the same discovery/read results in the intended ChatGPT conversation; HTTP smoke results alone do not prove that client's exposure. Research, paper validation and protected live are separate decisions. Private CI/CD remains outside this public source tree; no untrusted fork code should run on private runners.
+
+### Shared main-account budget
+
+Separate funded allocations are optional. An owner can configure a single
+`shared_account` budget with `budgetCap` and `BINANCE_DEFAULT_STRATEGY_ID`.
+Readiness exposes the default ID and each budget's funding source and initial cap.
+This is a persistent accounting limit on existing holdings, not an exchange
+transfer or permission to use the entire account. The funding-only configuration
+does not waive risk/recovery, stream, reconciliation, fees or protection checks.

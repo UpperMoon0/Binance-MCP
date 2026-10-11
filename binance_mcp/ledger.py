@@ -54,7 +54,18 @@ class Ledger:
         """)
         with self.transaction():
             for key, cfg in (allocations or {}).items():
-                amount = number(cfg["allocation"])
+                funding = cfg.get("fundingSource", "allocated")
+                if funding not in ("allocated", "shared_account"):
+                    raise BinanceClientError("invalid funding source")
+                if funding == "shared_account":
+                    if "allocation" in cfg or "budgetCap" not in cfg or cfg.get("reinvest", False) is not False:
+                        raise BinanceClientError("shared account requires budgetCap, no allocation, and reinvest=false")
+                    amount = number(cfg["budgetCap"])
+                else:
+                    if "budgetCap" in cfg:
+                        raise BinanceClientError("budgetCap requires shared_account funding")
+                    amount = number(cfg["allocation"])
+                reinvest = cfg.get("reinvest", funding != "shared_account")
                 mode = cfg.get("mode", "paper")
                 quote = cfg.get("quote", "USDT")
                 if mode not in ("paper", "live"):
@@ -62,21 +73,27 @@ class Ledger:
                 location = cfg.get("location", "SPOT")
                 if location != "SPOT" and not (location.startswith("EARN:") and len(location) > 5):
                     raise BinanceClientError("initial allocation location must be SPOT or EARN:productId")
-                policy_digest = self.fingerprint({"mode": mode, "quote": quote, "allocation": str(amount), "reinvest": cfg.get("reinvest", True), "location": location})
+                funding_policy = {"mode": mode, "quote": quote, "allocation": str(amount), "reinvest": reinvest, "location": location}
+                if funding == "shared_account":
+                    funding_policy["fundingSource"] = funding
+                policy_digest = self.fingerprint(funding_policy)
                 saved_policy = self.meta("allocationPolicy:" + key)
                 if saved_policy is not None and saved_policy != policy_digest:
                     raise BinanceClientError("existing allocation policy is immutable")
                 old = self.db.execute("SELECT * FROM strategies WHERE id=?", (key,)).fetchone()
                 if old:
+                    if funding == "shared_account" and self.meta("fundingSource:" + key) != funding:
+                        raise BinanceClientError("existing funding source is immutable; owner migration required")
                     if (old["mode"], old["quote"], Decimal(old["initial"]), bool(old["reinvest"])) != (
-                        mode, quote, amount, cfg.get("reinvest", True)
+                        mode, quote, amount, reinvest
                     ):
                         raise BinanceClientError("existing allocation is immutable; use an audited migration")
                     continue
                 self.db.execute("INSERT INTO strategies VALUES(?,?,?,?,?)",
-                                (key, mode, quote, str(amount), int(cfg.get("reinvest", True))))
+                                (key, mode, quote, str(amount), int(reinvest)))
                 self.db.execute("INSERT INTO balances VALUES(?,?,?,?,?)", (key, quote, location, str(amount), "0"))
                 self.set_meta("allocationPolicy:" + key, policy_digest)
+                self.set_meta("fundingSource:" + key, funding)
             # Risk/recovery policies are owner configuration, separate from funding.
             # Reopening a database without configuration preserves the approved policy.
             from .policy import validate
@@ -126,7 +143,8 @@ class Ledger:
         row = self.db.execute("SELECT * FROM strategies WHERE id=?", (key,)).fetchone()
         if row is None:
             raise BinanceClientError("strategy must be provisioned by deployment allocation policy")
-        return dict(row)
+        return {**dict(row), "fundingSource": self.meta("fundingSource:" + key) or "allocated",
+                "budgetCap": row["initial"]}
 
     def get(self, key: str) -> dict | None:
         row = self.db.execute("SELECT * FROM intents WHERE id=?", (key,)).fetchone()

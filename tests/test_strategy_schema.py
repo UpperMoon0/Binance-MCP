@@ -21,7 +21,8 @@ def test_rpc_schema_requires_intents_on_every_financial_tool():
         tools = {t["name"]: t for t in response.json()["result"]["tools"]}
         for name in ("binance_order_request", "binance_simple_earn_subscribe", "binance_simple_earn_redeem",
                      "binance_dual_investment_subscribe", "binance_dual_investment_from_flexible_earn", "binance_strategy_execution"):
-            assert {"strategyId", "intentId"} <= set(tools[name]["inputSchema"]["required"])
+            assert "intentId" in tools[name]["inputSchema"]["required"]
+            assert "strategyId" not in tools[name]["inputSchema"]["required"]
         assert {"binance_trade_preview", "binance_portfolio_snapshot", "binance_market_scan",
                 "binance_strategy_status", "binance_execution_status"} <= tools.keys()
         response = client.post("/mcp/", headers=headers, json={"jsonrpc": "2.0", "id": 2, "method": "tools/call",
