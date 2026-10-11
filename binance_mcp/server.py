@@ -13,7 +13,7 @@ from pydantic import Field
 from .client import BinanceClient, BinanceClientError, Scalar
 from .diagnostics import rpc_guard, readiness
 from . import fees
-from .incidents import configured_sink
+from .incidents import configured_sink, receiver_required
 from .config import Product
 from .execution import ExecutionService
 from .ledger import Ledger
@@ -27,7 +27,8 @@ client = BinanceClient()
 investment = InvestmentService(client)
 ledger = Ledger(os.getenv("BINANCE_LEDGER_PATH", "data/strategy.sqlite"),
                 json.loads(os.getenv("BINANCE_STRATEGIES", "{}")))
-execution = ExecutionService(client, ledger, [s.strip() for s in os.getenv("BINANCE_APPROVED_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()])
+execution = ExecutionService(client, ledger, [s.strip() for s in os.getenv("BINANCE_APPROVED_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()],
+                             incident_receiver_required=receiver_required())
 monitor = Monitor(execution, float(os.getenv("BINANCE_MONITOR_INTERVAL_SECONDS", "30")), incident_sink=configured_sink())
 server = MCPServer(
     "Binance MCP",
