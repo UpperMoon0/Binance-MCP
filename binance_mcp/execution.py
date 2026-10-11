@@ -37,7 +37,7 @@ def client_id(intent: str, suffix: str = "") -> str:
 
 
 class ExecutionService:
-    def __init__(self, client, ledger: Ledger, symbols: list[str], *, incident_receiver_required: bool = True):
+    def __init__(self, client, ledger: Ledger, symbols: list[str], *, incident_receiver_required: bool = True, default_strategy_id: str | None = None):
         self.client, self.ledger = client, ledger
         self.snapshots = Snapshots(client, ledger, symbols)
         self.investment = InvestmentService(client)
@@ -46,6 +46,19 @@ class ExecutionService:
             raise ValueError('incident_receiver_required must be a boolean')
         self.incident_receiver_required = incident_receiver_required
         self.incident_sink_configured = False
+        if default_strategy_id is not None:
+            ledger.strategy(default_strategy_id)
+        self.default_strategy_id = default_strategy_id
+
+    def resolve_strategy(self, strategy: str | None) -> str:
+        if strategy is None:
+            strategy = self.default_strategy_id
+            if strategy is None:
+                raise BinanceClientError("no default budget configured", blocker="DEFAULT_BUDGET_UNCONFIGURED")
+        if not isinstance(strategy, str) or not strategy.strip():
+            raise BinanceClientError("invalid strategy id", blocker="INVALID_EVIDENCE")
+        self.ledger.strategy(strategy)
+        return strategy
 
     async def symbol(self, symbol: str) -> dict:
         if symbol not in self.snapshots.symbols:
@@ -81,7 +94,8 @@ class ExecutionService:
                 if (up and price > average * number(up)) or (down and price < average * number(down)):
                     raise BinanceClientError("price violates percent price filter")
 
-    async def preview(self, strategy: str, operation: str, params: dict) -> dict:
+    async def preview(self, strategy: str | None, operation: str, params: dict) -> dict:
+        strategy = self.resolve_strategy(strategy)
         started_at = int(time.time()*1000)
         cfg = self.ledger.strategy(strategy)
         if operation not in ("order", "oco", "otoco"):
@@ -266,7 +280,8 @@ class ExecutionService:
                           belowStopPrice=p["stopPrice"], belowClientOrderId=client_id(intent_id, "stop"))
         return "/api/v3/orderList/" + op, params
 
-    async def execute(self, strategy: str, intent_id: str, operation: str, params: dict) -> dict:
+    async def execute(self, strategy: str | None, intent_id: str, operation: str, params: dict) -> dict:
+        strategy = self.resolve_strategy(strategy)
         payload = {"operation": operation, "params": params}
         async with self.lock:
             old = self.ledger.get(intent_id)

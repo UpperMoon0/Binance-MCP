@@ -28,13 +28,14 @@ investment = InvestmentService(client)
 ledger = Ledger(os.getenv("BINANCE_LEDGER_PATH", "data/strategy.sqlite"),
                 json.loads(os.getenv("BINANCE_STRATEGIES", "{}")))
 execution = ExecutionService(client, ledger, [s.strip() for s in os.getenv("BINANCE_APPROVED_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()],
-                             incident_receiver_required=receiver_required())
+                             incident_receiver_required=receiver_required(),
+                             default_strategy_id=os.getenv("BINANCE_DEFAULT_STRATEGY_ID", "").strip() or None)
 monitor = Monitor(execution, float(os.getenv("BINANCE_MONITOR_INTERVAL_SECONDS", "30")), incident_sink=configured_sink())
 server = MCPServer(
     "Binance MCP",
     instructions=(
         "Use binance_public_request for public Binance REST data and binance_account_request for read-only signed account endpoints. "
-        "Every write requires a deployment-provisioned strategyId and stable intentId. Use protected OTOCO for entries, owned OCO for exits, and named investment tools; never request arbitrary signed POSTs. Repeated intents reconcile without re-submitting. "
+        "Every write requires a stable intentId and a provisioned budget. strategyId may be omitted only when an owner-configured default budget exists. Use protected OTOCO for entries, owned OCO for exits, and named investment tools; never request arbitrary signed POSTs. Repeated intents reconcile without re-submitting. "
         "Trading is separately deployment-gated. Never request or reveal Binance secrets in chat. Withdrawals are intentionally unsupported."
     ),
 )
@@ -94,7 +95,7 @@ async def binance_order_request(
     action: Annotated[Literal["create", "cancel"], Field(description="Order action")],
     params: Annotated[dict[str, Scalar], Field(description="Order parameters required by Binance")],
     *,
-    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    strategyId: Annotated[str | None, Field(description="Budget ID; omit to use the owner-configured default budget")] = None,
     intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
     if product != "spot":
@@ -114,7 +115,7 @@ async def binance_simple_earn_subscribe(
     autoSubscribe: Annotated[bool, Field(description="Whether to enable automatic subscription for this product. Defaults to false.")] = False,
     sourceAccount: Annotated[Literal["SPOT"], Field(description="Managed source is SPOT only")] = "SPOT",
     *,
-    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    strategyId: Annotated[str | None, Field(description="Budget ID; omit to use the owner-configured default budget")] = None,
     intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
     return await execution.execute(strategyId, intentId, "earn_subscribe", {
@@ -132,7 +133,7 @@ async def binance_simple_earn_redeem(
     amount: Annotated[str, Field(description="Positive decimal amount to redeem")],
     destAccount: Annotated[Literal["SPOT"], Field(description="Managed destination is SPOT only")] = "SPOT",
     *,
-    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    strategyId: Annotated[str | None, Field(description="Budget ID; omit to use the owner-configured default budget")] = None,
     intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
     return await execution.execute(strategyId, intentId, "earn_redeem", {
@@ -158,7 +159,7 @@ async def binance_dual_investment_subscribe(
         Field(description="Optional minimum live strike distance percentage, e.g. 2.0"),
     ] = None,
     *,
-    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    strategyId: Annotated[str | None, Field(description="Budget ID; omit to use the owner-configured default budget")] = None,
     intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
     return await execution.execute(strategyId, intentId, "dual_subscribe", {
@@ -206,7 +207,7 @@ async def binance_dual_investment_from_flexible_earn(
     ] = None,
     autoCompoundPlan: Annotated[Literal["NONE"], Field(description="Managed workflows disable auto compounding")] = "NONE",
     *,
-    strategyId: Annotated[str, Field(description="Deployment-provisioned strategy allocation ID")],
+    strategyId: Annotated[str | None, Field(description="Budget ID; omit to use the owner-configured default budget")] = None,
     intentId: Annotated[str, Field(description="Stable unique execution intent; repeated calls reconcile the original")],
 ) -> object:
     return await execution.execute(strategyId, intentId, "earn_to_dual", {
@@ -230,15 +231,15 @@ async def binance_auth_status() -> dict:
 @server.tool(title="Strategy trade preview", annotations=READ_ONLY,
              description="Validate protected Spot entry/exit against live filters, fees, spread, account permissions and strategy capital. Execution revalidates.")
 @rpc_guard
-async def binance_trade_preview(strategyId: str, operation: Literal["order", "oco", "otoco"], params: dict[str, Scalar]) -> dict:
+async def binance_trade_preview(operation: Literal["order", "oco", "otoco"], params: dict[str, Scalar], strategyId: str | None = None) -> dict:
     return await execution.preview(strategyId, operation, params)
 
 
 @server.tool(title="Strategy execution", annotations=WRITE,
              description="Persistent budgeted workflow: OTOCO limit BUY with fee-adjusted exits, owned SELL OCO, limit SELL, or linked cancellation. Never retries uncertain writes. Params for entry: symbol, quantity, price, takeProfit, stopPrice. Cancel: targetIntentId.")
 @rpc_guard
-async def binance_strategy_execution(strategyId: str, intentId: str,
-                                     operation: Literal["order", "oco", "otoco", "cancel"], params: dict[str, Scalar]) -> dict:
+async def binance_strategy_execution(intentId: str, operation: Literal["order", "oco", "otoco", "cancel"],
+                                     params: dict[str, Scalar], strategyId: str | None = None) -> dict:
     return await execution.execute(strategyId, intentId, operation, params)
 
 
@@ -301,7 +302,8 @@ async def binance_market_scan(symbols: list[str], shortlist: list[str] | None = 
 @server.tool(title="Strategy accounting and monitor status", annotations=READ_ONLY,
              description="Owned capital, reservations, categorized realized results/commissions, unrealized quote valuation, paper state and operational monitor freshness.")
 @rpc_guard
-async def binance_strategy_status(strategyId: str) -> dict:
+async def binance_strategy_status(strategyId: str | None = None) -> dict:
+    strategyId = execution.resolve_strategy(strategyId)
     cfg = ledger.strategy(strategyId)
     assets = {r[0] for r in ledger.db.execute("SELECT asset FROM balances WHERE strategy=? AND asset!=?", (strategyId, cfg["quote"]))}
     prices = {}

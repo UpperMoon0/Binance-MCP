@@ -4,13 +4,13 @@ A compact Binance MCP service with server-side credentials, persistent strategy 
 
 ## Strategy execution
 
-Every financial write requires `strategyId` and a stable `intentId`. The allocation is provisioned by the deployment owner, persisted once in SQLite, and never replenished on a request or restart. Selling and reusing a strategy's own proceeds is allowed; losses reduce the capital available for the next entry. `reinvest=false` moves realized gains into a separate non-spendable profit reserve.
+Every financial write requires a stable `intentId` and a provisioned accounting budget. `strategyId` is optional when the deployment owner sets `BINANCE_DEFAULT_STRATEGY_ID`; otherwise it remains necessary. The budget is persisted once in SQLite and never replenished on a request or restart. Selling and reusing a strategy's own proceeds is allowed; losses reduce the capital available for the next entry. `reinvest=false` moves realized gains into a separate non-spendable profit reserve.
 
 Reservations are shared by ordinary Spot orders, linked orders, Flexible Earn subscriptions/redemptions, and Dual Investment. Amounts use decimal arithmetic. An intent and its complete contract are committed before the exchange request. The Earn-to-DI saga checkpoints its redemption and refreshed DI contract before each write. A repeated intent with the same contract reconciles the original; a different contract is rejected.
 
 After a redemption is accepted, a later read rejection retains the saga checkpoint and reservation. Recovery verifies the unique PAID redemption history and Spot receipt before moving ownership; it never repeats the redemption automatically. A definitive rejection of the first write can release its reservation.
 
-Capital is tracked by strategy, asset and location (`SPOT`, `EARN:productId`, `DI:positionId`, `PROFIT_RESERVE`). Configure separate allocations for an experiment, conservative holdings and an ETH buyback reserve. One strategy cannot sell or redeem another strategy's holdings. The ledger is not a lifetime turnover counter.
+Capital is tracked by strategy, asset and location (`SPOT`, `EARN:productId`, `DI:positionId`, `PROFIT_RESERVE`). Separate allocations are optional. A single default budget can use a bounded part of the existing main account; no second wallet or funding transfer is required. Independently owned reserves still require explicit ownership accounting. One strategy cannot sell or redeem another strategy's holdings. The ledger is not a lifetime turnover counter.
 
 Recovery SELL and OCO requests can proceed during a protection pause only after a fresh Spot account read backs the aggregate ownership of the sold asset across every live strategy. This includes non-spendable profit reserves and both free and locked Spot balances; holdings in Earn or DI cannot back a Spot sale. Missing or invalid balance evidence blocks submission. The request must also fit the requesting strategy's unreserved capital and the account's free balance. Cancellation remains available during ownership pauses and account-read failures.
 
@@ -23,7 +23,16 @@ BINANCE_APPROVED_SYMBOLS=BTCUSDT,ETHUSDT
 BINANCE_MONITOR_INTERVAL_SECONDS=30
 ```
 
-An example owner-provisioned paper allocation:
+To use existing account funds without a second funded allocation:
+
+```dotenv
+BINANCE_DEFAULT_STRATEGY_ID=main
+BINANCE_STRATEGIES={"main":{"fundingSource":"shared_account","budgetCap":"100","quote":"USDT","mode":"live","reinvest":false,"location":"EARN:USDT001"}}
+```
+
+This records 100 USDT of existing Flexible Earn holdings as the main budget, without redeeming, transferring or placing an order. Change the location to `SPOT` only when the funds are already there. Shared-account funding requires a positive `budgetCap`, disallows `allocation`, and disables profit reinvestment to keep realized gains outside spendable capital. The funding source, initial cap and location are immutable across restarts. Losses and pending reservations remain deducted. A missing default budget never falls back to unrestricted account funds; an explicit unknown ID is rejected.
+
+Existing `allocation` configurations remain compatible. An example owner-provisioned paper allocation:
 
 ```json
 {"experiment":{"allocation":"100","quote":"USDT","mode":"paper","reinvest":true}}
@@ -65,7 +74,7 @@ Existing accounts must be reconciled before enabling live mode. Keep trading dis
 | `binance_order_request` | Compatibility tool for guarded Spot LIMIT SELL or recorded-intent cancellation |
 | `binance_auth_status` | Redacted signing/trading capability |
 
-**Version 0.2 breaks unbudgeted financial calls:** every existing financial tool now requires both IDs. Derivative mutations, arbitrary order parameters, Funding-account movements, automatic Earn subscriptions and DI compounding are disabled in managed workflows. Read access remains available. Ordinary BUY orders must use protected `otoco`; individual raw stop parameters are no longer a bypass around the guarded linked workflow.
+**Version 0.2 introduced budgeted financial calls:** stable intent IDs remain mandatory; the strategy ID may now be omitted when an owner-configured default budget exists. Derivative mutations, arbitrary order parameters, Funding-account movements, automatic Earn subscriptions and DI compounding are disabled in managed workflows. Read access remains available. Ordinary BUY orders must use protected `otoco`; individual raw stop parameters are no longer a bypass around the guarded linked workflow.
 
 ### Protected Spot entry example
 
