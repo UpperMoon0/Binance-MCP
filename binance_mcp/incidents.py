@@ -173,6 +173,15 @@ def acknowledge(ledger, incident_id, evidence):
     update(ledger, incident, incident['state'], acknowledgedAt=int(time.time()*1000), acknowledgmentEvidence=evidence)
 
 
+def receiver_required():
+    """Only an explicit deployment opt-out makes external delivery optional."""
+    import os
+    value = os.getenv('BINANCE_INCIDENT_RECEIVER_REQUIRED', 'true').strip().lower()
+    if value not in ('true', 'false'):
+        raise ValueError('BINANCE_INCIDENT_RECEIVER_REQUIRED must be true or false')
+    return value == 'true'
+
+
 def configured_sink():
     """Optional owner-configured idempotent HTTPS incident receiver; never tested live."""
     import os

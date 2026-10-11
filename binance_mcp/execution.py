@@ -37,11 +37,14 @@ def client_id(intent: str, suffix: str = "") -> str:
 
 
 class ExecutionService:
-    def __init__(self, client, ledger: Ledger, symbols: list[str]):
+    def __init__(self, client, ledger: Ledger, symbols: list[str], *, incident_receiver_required: bool = True):
         self.client, self.ledger = client, ledger
         self.snapshots = Snapshots(client, ledger, symbols)
         self.investment = InvestmentService(client)
         self.lock = asyncio.Lock()
+        if type(incident_receiver_required) is not bool:
+            raise ValueError('incident_receiver_required must be a boolean')
+        self.incident_receiver_required = incident_receiver_required
         self.incident_sink_configured = False
 
     async def symbol(self, symbol: str) -> dict:
@@ -280,7 +283,7 @@ class ExecutionService:
                 if operation not in ('order', 'oco', 'cancel'):
                     if not self.ledger.meta('recoveryPolicy:' + strategy):
                         raise BinanceClientError('owner recovery policy required', blocker='RECOVERY_POLICY_REQUIRED')
-                    if not self.incident_sink_configured:
+                    if self.incident_receiver_required and not self.incident_sink_configured:
                         raise BinanceClientError('operator incident channel required', blocker='INCIDENT_CHANNEL_UNCONFIGURED')
                 await self.reconcile_all()
                 if operation not in ("cancel", "oco", "order"):

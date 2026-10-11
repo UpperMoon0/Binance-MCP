@@ -80,7 +80,7 @@ async def readiness(svc, monitor, tools, *, check_exchange=False):
         global_blockers.append('MONITOR_EVIDENCE_STALE')
     if not ledger.meta('streamConnected'):
         global_blockers.append('STREAM_DISCONNECTED')
-    if monitor.incident_sink is None:
+    if svc.incident_receiver_required and monitor.incident_sink is None:
         global_blockers.append('INCIDENT_CHANNEL_UNCONFIGURED')
     active = incidents.rows(ledger, active=True)
     if active:
@@ -122,6 +122,9 @@ async def readiness(svc, monitor, tools, *, check_exchange=False):
                              'connectorExposure': 'VERIFY_CLIENT_DISCOVERY', 'financialWriteSmokeTest': False},
             'strategies': strategies, 'provisioned': bool(strategies),
             'monitor': {k: ledger.meta(k) for k in ('heartbeatAt', 'monitorAt', 'reconciledAt', 'protectionAt', 'streamConnected', 'lastUserEventAt')},
+            'incidentNotifications': {'required': svc.incident_receiver_required,
+                                      'configured': monitor.incident_sink is not None,
+                                      'deliveryMode': 'WEBHOOK' if monitor.incident_sink is not None else 'LOCAL_ONLY'},
             'incidents': active, 'reservations': [{'intentId': i['id'], 'strategyId': i['strategy'], 'state': i['state'], 'asset': i['asset'], 'quantity': i['reserved']} for i in ledger.outstanding()],
             'research': {'functionallyChecked': check_exchange, 'accountScopeComplete': bool(observation and observation['portfolio']['complete']),
                          'observations': observation},

@@ -39,7 +39,7 @@ A live deployment can provision independent locations:
 }
 ```
 
-These are examples, not automatic allocations. Live allocations must be backed at the configured account location. Existing allocation policies are immutable across restarts. Live entries also require a separately approved complete risk policy, bounded recovery policy, and configured incident receiver; the funding-only examples above cannot activate live trading. All worker processes must use the same durable SQLite file. Run **one ASGI worker** so the account stream, monitor and execution coordinator have one owner. Multiple ledger connections still enforce atomic reservations; multiple independent monitoring workers are not supported.
+These are examples, not automatic allocations. Live allocations must be backed at the configured account location. Existing allocation policies are immutable across restarts. Live entries also require a separately approved complete risk policy, bounded recovery policy, and, by default, a configured incident receiver; the funding-only examples above cannot activate live trading. All worker processes must use the same durable SQLite file. Run **one ASGI worker** so the account stream, monitor and execution coordinator have one owner. Multiple ledger connections still enforce atomic reservations; multiple independent monitoring workers are not supported.
 
 Existing accounts must be reconciled before enabling live mode. Keep trading disabled while importing owner-reviewed accounting evidence. Never delete the ledger to recover a timeout or to reset the budget.
 
@@ -118,6 +118,8 @@ The Earn-to-DI workflow preserves `preserveEarnAmount`, verifies Spot receipt an
 The app lifespan starts a small monitor independently of any research cycle. It subscribes to Binance's signed `userDataStream.subscribe.signature` WebSocket API, reacts to account/order/list events and reconciles with REST every 30 seconds (configurable 5..60). It synchronizes server time, detects outside activity, verifies protection, and checks account coverage. Stream disconnects, stale monitor state over 90 seconds and unresolved executions block entries. Recovery never resends a financial write.
 
 The monitor clears only operational pauses after all corresponding checks pass. A reconciliation failure anywhere in the live tick retains the pause and last successful monitor timestamp, even if the journal previously recorded active protective orders. Outside/manual account changes, rewards and DI settlement mismatches require an attributed owner audit. `binance_readiness` exposes scoped readiness and runtime/schema identity; transport/authentication health alone does not imply funds are reconciled or an entry is protected.
+
+External incident delivery may be explicitly made optional with `BINANCE_INCIDENT_RECEIVER_REQUIRED=false` in deployment configuration. The default is `true`; invalid values fail startup. Without a webhook, readiness reports `incidentNotifications.deliveryMode=LOCAL_ONLY`. Incidents remain persisted and all monitoring, ownership, risk, protection and recovery-policy gates remain enforced. Inspect readiness for incidents; local-only mode sends no external alert and does not imply operator acknowledgment.
 
 ### Accounting audits
 
