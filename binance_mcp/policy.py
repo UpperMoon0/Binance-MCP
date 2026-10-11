@@ -5,7 +5,7 @@ import time
 from .client import BinanceClientError
 from .ledger import number
 
-OPERATIONS = {'otoco', 'order', 'oco', 'cancel', 'earn_subscribe', 'earn_redeem', 'dual_subscribe', 'earn_to_dual'}
+OPERATIONS = {'buy_ioc', 'otoco', 'order', 'oco', 'cancel', 'earn_subscribe', 'earn_redeem', 'dual_subscribe', 'earn_to_dual'}
 REQUIRED = {'version', 'approved', 'operations', 'assets', 'maxPositions', 'maxPositionQuote',
             'maxPlannedDownsideQuote', 'lossPauseQuote', 'executionAllowanceBps', 'valuationMaxAgeMs'}
 
@@ -77,7 +77,7 @@ def entry_check(ledger, strategy, preview, *, persist_loss=False):
         if persist_loss:
             ledger.set_meta('riskPause:' + strategy, {'code': 'LOSS_PAUSED', 'observedAt': now, 'pnlQuote': str(pnl)})
         raise BinanceClientError('strategy loss threshold reached', blocker='LOSS_PAUSED')
-    positions = [i for i in ledger.outstanding() if i['strategy'] == strategy and i['payload'].get('operation') in ('otoco', 'dual_subscribe', 'earn_to_dual')]
+    positions = [i for i in ledger.outstanding() if i['strategy'] == strategy and i['payload'].get('operation') in ('buy_ioc', 'otoco', 'dual_subscribe', 'earn_to_dual')]
     # Filled holdings without their source intent (legacy/cancelled partial fills)
     # occupy slots too; linked siblings never count as independent positions.
     import json
@@ -113,12 +113,12 @@ def entry_check(ledger, strategy, preview, *, persist_loss=False):
     locked_di = sum(1 for b in report['balances'] if b['location'].startswith('DI:') and number(b['quantity'], zero=True))
     if preview['operation'] != 'earn_subscribe' and len(positions) + len(orphaned) + locked_di >= policy['maxPositions']:
         raise BinanceClientError('maximum concurrent entry commitments reached', blocker='POSITION_COUNT')
-    value = number(preview['reservation'])
+    value = number(preview.get('reservationQuote', preview['reservation']))
     if value > number(policy['maxPositionQuote']):
         raise BinanceClientError('maximum position value exceeded', blocker='POSITION_VALUE')
     if preview['operation'] != 'otoco':
-        if preview['operation'] in ('dual_subscribe', 'earn_to_dual') and value > number(policy['maxPlannedDownsideQuote']):
-            raise BinanceClientError('DI entire principal exceeds planned downside policy', blocker='PLANNED_DOWNSIDE')
+        if preview['operation'] in ('buy_ioc', 'dual_subscribe', 'earn_to_dual') and value > number(policy['maxPlannedDownsideQuote']):
+            raise BinanceClientError('unprotected entire principal exceeds planned downside policy', blocker='PLANNED_DOWNSIDE')
         return
     quantity = number(preview['params']['quantity'])
     price = number(preview['params']['price'])

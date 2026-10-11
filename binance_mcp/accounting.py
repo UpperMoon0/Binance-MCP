@@ -6,12 +6,14 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 from decimal import Decimal
 from pathlib import Path
 
 from .client import BinanceClient, BinanceClientError
 from .execution import ExecutionService
 from .ledger import Ledger, number
+from . import buyhold
 
 CATEGORIES = {"deposit", "withdrawal", "earn_reward", "settlement", "commission", "loss", "transfer"}
 
@@ -50,6 +52,58 @@ def apply_audit(ledger: Ledger, audit: dict, observed_totals: dict[str, str]) ->
         if any(candidate.get(a, Decimal(0)) != number(observed_totals.get(a, "0"), zero=True)
                for a in set(candidate) | set(observed_totals)):
             raise BinanceClientError("audit does not explain complete observed account totals")
+        recoveries = audit.get('iocRecoveries', [])
+        earn_recoveries = audit.get('earnRecoveries', [])
+        if recoveries and earn_recoveries:
+            raise BinanceClientError('recovery types must use separate audits')
+        if recoveries:
+            if audit.get('adjustments') or audit.get('resolveIntents'):
+                raise BinanceClientError('IOC recovery must be a standalone exact-fill audit', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
+            svc = ExecutionService(None, ledger, [])
+            recovered_ids = set()
+            for recovery in recoveries:
+                intent = ledger.get(recovery['intentId'])
+                if (intent is None or intent['payload'].get('operation') != 'buy_ioc'
+                        or intent['state'] not in ('PREPARED', 'OUTCOME_UNKNOWN', 'OPEN')
+                        or intent['id'] in recovered_ids or recovery.get('approveActualFees') is not True
+                        or not 0 <= int(time.time()*1000) - recovery.get('observedAt', 0) <= 90000):
+                    raise BinanceClientError('fresh intent-bound IOC recovery evidence required', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
+                svc.resolve_ioc_evidence(intent, recovery['order'], recovery['trades'], recovery['openOrders'], audit=audit)
+                recovered_ids.add(intent['id'])
+            derived = ledger.meta('expectedTotals')
+            if any(Decimal(derived.get(a, '0')) != candidate.get(a, Decimal(0)) for a in set(derived) | set(candidate)):
+                raise BinanceClientError('IOC recovery fills do not explain complete account deltas', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
+        elif earn_recoveries:
+            if audit.get('adjustments') or audit.get('resolveIntents') or audit.get('accountDeltas'):
+                raise BinanceClientError('Earn recovery requires standalone location-only evidence', blocker='EARN_AUDIT_RECOVERY_REQUIRED')
+            svc = ExecutionService(None, ledger, [])
+            recovered_ids = set()
+            for recovery in earn_recoveries:
+                intent = ledger.get(recovery['intentId'])
+                observed_at = recovery.get('observedAt', 0)
+                if (intent is None or intent['state'] not in ('PREPARED', 'OUTCOME_UNKNOWN', 'OPEN')
+                        or intent['id'] in recovered_ids or recovery.get('approveAttribution') is not True
+                        or type(observed_at) is not int or not 0 <= int(time.time()*1000)-observed_at <= 90000):
+                    raise BinanceClientError('fresh owner-attributed Earn recovery required', blocker='EARN_AUDIT_RECOVERY_REQUIRED')
+                svc.resolve_earn_evidence(intent, recovery['record'], observed_at=observed_at, audit=audit)
+                recovered_ids.add(intent['id'])
+        else:
+            for resolution in audit.get('resolveIntents', []):
+                intent = ledger.get(resolution['intentId'])
+                if intent and (intent['result'] or {}).get('preview', {}).get('acquiredAsset'):
+                    raise BinanceClientError('acquired Earn terminal audit requires exact receipt recovery', blocker='EARN_AUDIT_RECOVERY_REQUIRED')
+                if intent and intent['payload'].get('operation') == 'buy_ioc':
+                    raise BinanceClientError('IOC terminal audit requires exact order/fill recovery evidence', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
+            # Do not separately book an unresolved IOC's balances and later book its fills again.
+            for adjustment in audit.get('adjustments', []):
+                for intent in ledger.outstanding():
+                    preview = (intent['result'] or {}).get('preview', {})
+                    if (preview.get('acquiredAsset') and intent['strategy'] == adjustment['strategyId']
+                            and intent['asset'] == adjustment['asset']):
+                        raise BinanceClientError('unresolved acquired Earn requires exact receipt recovery', blocker='EARN_AUDIT_RECOVERY_REQUIRED')
+                    if (intent['payload'].get('operation') == 'buy_ioc' and intent['strategy'] == adjustment['strategyId']
+                            and adjustment['asset'] in (preview.get('base'), preview.get('quote'))):
+                        raise BinanceClientError('unresolved IOC accounting requires exact-fill recovery', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
         for index, adjustment in enumerate(audit.get("adjustments", [])):
             strategy = adjustment["strategyId"]
             cfg = ledger.strategy(strategy)
@@ -61,7 +115,16 @@ def apply_audit(ledger: Ledger, audit: dict, observed_totals: dict[str, str]) ->
             quote_value = signed_decimal(adjustment.get("quoteValue", "0"))
             if adjustment['asset'] != cfg['quote'] and quantity > 0 and cost <= 0:
                 raise BinanceClientError('positive non-quote attribution needs audited receipt cost basis')
-            ledger.change(strategy, adjustment["asset"], adjustment["location"], quantity, cost)
+            asset, location = adjustment['asset'], adjustment['location']
+            attributed = buyhold.quantity(ledger, strategy, asset, location)
+            if adjustment.get('buyHoldReward') is True:
+                buyhold.authorize(ledger, strategy, asset + cfg['quote'])
+                if category != 'earn_reward' or quantity <= 0 or not location.startswith('EARN:') or attributed <= 0:
+                    raise BinanceClientError('buy-and-hold reward requires owned Earn principal and positive reward evidence')
+                buyhold.change(ledger, strategy, asset, location, quantity)
+            elif quantity < 0:
+                buyhold.change(ledger, strategy, asset, location, -min(attributed, -quantity))
+            ledger.change(strategy, asset, location, quantity, cost)
             ledger.event(key + ":" + str(index), strategy, category, adjustment["asset"], quantity, quote_value,
                          detail={"evidence": audit["evidence"], "adjustment": adjustment})
         for resolution in audit.get("resolveIntents", []):
