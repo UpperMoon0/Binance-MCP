@@ -31,7 +31,8 @@ class IocExchange(Exchange):
     def __init__(self, ledger):
         super().__init__()
         self.ledger = ledger
-        self.info.update(symbol='ETHUSDT', baseAsset='ETH')
+        self.info.update(symbol='ETHUSDT', baseAsset='ETH', defaultSelfTradePreventionMode='NONE',
+                         allowedSelfTradePreventionModes=['NONE', 'EXPIRE_TAKER'])
         self.account['balances'][1]['asset'] = 'ETH'
         self.executed = '.5'
         self.status = 'FILLED'
@@ -70,7 +71,8 @@ class IocExchange(Exchange):
         fee = qty * Decimal('.001') if self.fee_asset == 'ETH' else qty * price * Decimal('.001')
         order = {'symbol': params['symbol'], 'orderId': oid, 'clientOrderId': params['newClientOrderId'],
                  'status': self.status, 'origQty': params['quantity'], 'executedQty': str(qty), 'side': 'BUY',
-                 'type': 'LIMIT', 'price': params['price'], 'timeInForce': 'IOC', 'cummulativeQuoteQty': str(qty*price)}
+                 'type': 'LIMIT', 'price': params['price'], 'timeInForce': 'IOC', 'cummulativeQuoteQty': str(qty*price),
+                 'selfTradePreventionMode': params['selfTradePreventionMode']}
         self.orders[oid] = order
         self.fills[oid] = [] if not qty else [{'id': oid, 'orderId': oid, 'qty': str(qty), 'quoteQty': str(qty*price),
             'price': str(price), 'commission': str(fee), 'commissionAsset': self.fee_asset, 'isBuyer': True}]

@@ -59,7 +59,12 @@ quantity/price filters, spread/slippage and backing. Quantities and prices are
 never silently rounded. `maxQuoteSpend` is mandatory and includes the conservative
 fee bound. An IOC does not need OCO/OTO availability or valid exit legs. Optional
 `side`, `type`, and `timeInForce` must be `BUY`, `LIMIT`, and `IOC`, respectively;
-exit parameters are rejected.
+exit parameters are rejected. The exchange must explicitly support
+`EXPIRE_TAKER` self-trade prevention. The request pins that mode and reconciliation
+checks it, so crossing the account's own resting ladder expires the taker remainder
+instead of filling, expiring or reducing the maker. Missing support fails closed;
+exchange defaults such as `EXPIRE_MAKER`, `EXPIRE_BOTH`, `DECREMENT` or `NONE` are
+never inherited. See the [official STP contract](https://github.com/binance/binance-spot-api-docs/blob/master/faqs/stp_faq.md).
 
 Submit the same operation/params through `binance_strategy_execution`, with a
 stable unique `intentId`. Execution performs fresh validation again. A successful
@@ -78,7 +83,9 @@ and a read-only open-order check excluding a live BUY remainder. Zero, partial,
 and full fills are supported. Unfilled commitments are released only then (or
 on an authoritative first-write rejection). Fill accounting and terminal release
 are atomic. Unexpected third-asset commissions or commissions beyond the verified
-bound require owner accounting; they do not silently debit another holding.
+bound fail closed; they do not silently debit another holding. Owner recovery for
+base/quote fee deviations uses the exact-fill audit described below. Third-asset
+fees remain unsupported by that recovery path.
 
 Results distinguish:
 
@@ -113,7 +120,11 @@ The write is `binance_simple_earn_subscribe` with the same explicit asset, exact
 product/amount, a new intent ID and the selected/default budget. Omitting `asset`
 preserves the prior quote-asset behavior.
 
-Non-quote subscriptions require owned, verified buy-and-hold units in Spot. They
+Non-quote subscriptions require owned, verified buy-and-hold units in Spot.
+The acquired subset is rechecked and reserved inside the same immediate SQLite
+transaction as ordinary financial ownership. Concurrent/stale previews cannot
+borrow unrelated units. Reconciliation requires the full exact attributed amount;
+a partial `min(owned, amount)` movement is not accepted. They
 cannot borrow unrelated account assets or legacy holdings. Current product asset,
 availability, minimum, start time, fee/valuation, exchange free balance and
 aggregate backing are checked. Dust stays in Spot. An unavailable product causes
@@ -140,6 +151,36 @@ evidenced rewards on already owned Earn principal with a receipt cost basis.
 The audit preserves the reward category and hold attribution without resetting
 purchase allowance. Ambiguous/unattributed rewards or location drift pause new
 execution; automatic pro-rata attribution across unrelated holdings is not assumed.
+
+## Exact ownership overlap and owner IOC recovery
+
+Each outgoing intent records its reserved hold subset. Owned SELL/OCO reservations
+use available non-hold units first, then an exact hold portion when needed. Fresh
+protection counts only that reservation's non-hold portion in addition to the full
+intentional hold subset. Disjoint protected and held inventory both count, while
+an exit attached to a hold cannot also cover unrelated inventory. Partial sells
+consume the recorded non-hold portion first and reduce only their own hold
+attribution. Earn cannot subscribe or redeem another intent's committed hold.
+
+A generic accounting `resolveIntents` audit cannot terminate a `buy_ioc` or book
+its pending base/quote balances independently. Doing so would release the allowance
+without recording the purchase. Use a standalone owner-only `iocRecoveries` audit
+for supported base/quote commission deviations, containing:
+
+- the existing audit `id`, owner `evidence` and exact complete `accountDeltas`
+- for each recovery, `intentId`, `approveActualFees=true`, fresh `observedAt`,
+  exact terminal `order`, complete `trades` and `openOrders` excluding its remainder
+- no generic `adjustments` or `resolveIntents` in the same audit
+
+The existing offline audit command obtains complete read-only account totals.
+Recovery checks original order identity/contract/STP, quantities, trade identity,
+commission assets, quote totals and no live remainder. It books actual fills,
+commissions, quote debit, finite allowance consumption and acquired holdings
+atomically before releasing the reservation. Derived account deltas must explain
+all observed totals or every table rolls back. Replaying the same audit is
+idempotent; changing its payload fails. Actual past fees can exhaust or exceed the
+allowance, but never reset it or authorize another buy. The original immutable
+request and owner pauses remain unchanged. This recovery sends no exchange write.
 
 ## Readiness and release evidence
 

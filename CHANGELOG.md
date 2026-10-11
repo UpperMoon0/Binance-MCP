@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Review hardening: pin maker-preserving EXPIRE_TAKER, atomically reserve acquired
+  subsets, distinguish overlapping protection, and require exact-fill IOC audit
+  recovery to preserve cumulative spend and attribution.
+
 - Add explicitly authorized unprotected LIMIT BUY/IOC with a fee-inclusive request
   cap and non-replenishing cumulative buyback allowance under existing budgets.
 - Persist intent/reservation before submission; reconcile terminal identity and

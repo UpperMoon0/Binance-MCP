@@ -108,6 +108,10 @@ class ExecutionService:
         if set(params) - allowed:
             raise BinanceClientError("unsupported order parameter; narrow workflow requires explicit limit prices")
         info = await self.symbol(params["symbol"])
+        if operation == 'buy_ioc':
+            allowed_stp = info.get('allowedSelfTradePreventionModes')
+            if not isinstance(allowed_stp, list) or 'EXPIRE_TAKER' not in allowed_stp:
+                raise BinanceClientError('maker-preserving IOC self-trade prevention unavailable', blocker='STP_UNSUPPORTED')
         if operation == 'buy_ioc' and 'orderTypes' in info and 'LIMIT' not in info['orderTypes']:
             raise BinanceClientError('symbol does not permit LIMIT orders', blocker='PERMISSIONS')
         if info["quoteAsset"] != cfg["quote"]:
@@ -268,6 +272,7 @@ class ExecutionService:
         if operation == 'buy_ioc':
             buyhold.check(self.ledger, strategy, result)
             result['buybackBudget'] = buyhold.budget(self.ledger, strategy)
+            result['selfTradePreventionMode'] = 'EXPIRE_TAKER'
         if not 0 <= int(time.time()*1000) - started_at <= 90000:
             raise BinanceClientError('trade observation stale', blocker='OBSERVATION_STALE')
         return result
@@ -277,7 +282,8 @@ class ExecutionService:
         p, op = preview["params"], preview["operation"]
         if op == "buy_ioc":
             return "/api/v3/order", {"symbol": p["symbol"], "side": "BUY", "type": "LIMIT", "timeInForce": "IOC",
-                "quantity": p["quantity"], "price": p["price"], "newClientOrderId": client_id(intent_id), "newOrderRespType": "FULL"}
+                "quantity": p["quantity"], "price": p["price"], "newClientOrderId": client_id(intent_id), "newOrderRespType": "FULL",
+                "selfTradePreventionMode": preview["selfTradePreventionMode"]}
         if op == "order":
             return "/api/v3/order", {"symbol": p["symbol"], "side": "SELL", "type": "LIMIT", "timeInForce": "GTC",
                 "quantity": p["quantity"], "price": p["price"], "newClientOrderId": client_id(intent_id)}
@@ -455,7 +461,7 @@ class ExecutionService:
         if acquired:
             buyhold.authorize(self.ledger, strategy, asset + cfg['quote'])
             source = 'SPOT' if op == 'earn_subscribe' else 'EARN:' + p['productId']
-            if buyhold.quantity(self.ledger, strategy, asset, source) < number(amount):
+            if buyhold.available(self.ledger, strategy, asset, source) < number(amount):
                 raise BinanceClientError('subscription/redemption exceeds verified acquired holdings', blocker='ACQUIRED_ASSET_OWNERSHIP')
             if op == 'earn_subscribe':
                 positions = await self.snapshots.pages('/sapi/v1/simple-earn/flexible/position', extra={'asset': asset})
@@ -606,22 +612,10 @@ class ExecutionService:
 
     async def reconcile_ioc(self, intent):
         """Only terminal order + complete trades + no live remainder can release funds."""
-        import json
         p, key = intent['payload']['params'], intent['id']
-        result = intent['result'] or {}
         order = await self.client.signed_get('spot', '/api/v3/order',
                     {'symbol': p['symbol'], 'origClientOrderId': client_id(key)})
-        if (order.get('clientOrderId') != client_id(key) or order.get('symbol') != p['symbol']
-                or order.get('side') != 'BUY' or order.get('type') != 'LIMIT' or order.get('timeInForce') != 'IOC'
-                or number(order.get('price', '0'), zero=True) != number(p['price'])
-                or number(order.get('origQty', '0'), zero=True) != number(p['quantity'])
-                or order.get('orderId') is None):
-            raise BinanceClientError('IOC order contract mismatch', blocker='ORDER_EVIDENCE', outcome_unknown=True)
-        if order.get('status') not in TERMINAL:
-            raise BinanceClientError('IOC has no terminal evidence', blocker='IOC_NOT_TERMINAL', outcome_unknown=True)
         open_orders = await self.client.signed_get('spot', '/api/v3/openOrders', {'symbol': p['symbol']})
-        if not isinstance(open_orders, list) or any(o.get('clientOrderId') == client_id(key) or o.get('orderId') == order['orderId'] for o in open_orders):
-            raise BinanceClientError('IOC live BUY remainder not excluded', blocker='IOC_LIVE_REMAINDER', outcome_unknown=True)
         rows, cursor = [], 0
         for _ in range(100):
             batch = await self.client.signed_get('spot', '/api/v3/myTrades',
@@ -637,6 +631,24 @@ class ExecutionService:
             cursor = next_cursor
         else:
             raise BinanceClientError('IOC fill pagination incomplete', blocker='FILL_EVIDENCE')
+        return self.resolve_ioc_evidence(intent, order, rows, open_orders)
+
+    def resolve_ioc_evidence(self, intent, order, rows, open_orders, *, audit=None):
+        """Shared exact evidence accounting; offline owner recovery may approve actual fees."""
+        import json
+        p, key = intent['payload']['params'], intent['id']
+        result = intent['result'] or {}
+        if (order.get('clientOrderId') != client_id(key) or order.get('symbol') != p['symbol']
+                or order.get('side') != 'BUY' or order.get('type') != 'LIMIT' or order.get('timeInForce') != 'IOC'
+                or order.get('selfTradePreventionMode') != 'EXPIRE_TAKER'
+                or number(order.get('price', '0'), zero=True) != number(p['price'])
+                or number(order.get('origQty', '0'), zero=True) != number(p['quantity'])
+                or order.get('orderId') is None):
+            raise BinanceClientError('IOC order contract mismatch', blocker='ORDER_EVIDENCE', outcome_unknown=True)
+        if order.get('status') not in TERMINAL:
+            raise BinanceClientError('IOC has no terminal evidence', blocker='IOC_NOT_TERMINAL', outcome_unknown=True)
+        if not isinstance(open_orders, list) or any(o.get('clientOrderId') == client_id(key) or o.get('orderId') == order['orderId'] for o in open_orders):
+            raise BinanceClientError('IOC live BUY remainder not excluded', blocker='IOC_LIVE_REMAINDER', outcome_unknown=True)
         qty = sum((number(t['qty']) for t in rows), Decimal(0))
         spent = sum((number(t['quoteQty']) for t in rows), Decimal(0))
         if (len({str(t['id']) for t in rows}) != len(rows)
@@ -655,7 +667,7 @@ class ExecutionService:
                     or (commission and asset not in (base, quote))):
                 raise BinanceClientError('IOC fill contradicts approved contract', blocker='FILL_EVIDENCE', outcome_unknown=True)
             basis = size if asset == base else proceeds
-            if commission > basis * number(preview['feeRateBound'], zero=True):
+            if audit is None and commission > basis * number(preview['feeRateBound'], zero=True):
                 raise BinanceClientError('IOC commission exceeds verified bound', blocker='FEE_RATE_CHANGED', outcome_unknown=True)
             prior = self.ledger.db.execute('SELECT strategy,detail FROM events WHERE id=?',
                 ('trade:' + p['symbol'] + ':' + str(trade['id']),)).fetchone()
@@ -665,11 +677,13 @@ class ExecutionService:
             fee_value += commission if asset == quote else commission * price if asset == base else Decimal(0)
         quote_debit = spent + commissions.get(quote, Decimal(0))
         net = qty - commissions.get(base, Decimal(0))
-        if spent + fee_value > min(number(p['maxQuoteSpend']), number(preview['reservation'])):
+        if audit is None and spent + fee_value > min(number(p['maxQuoteSpend']), number(preview['reservation'])):
             raise BinanceClientError('verified IOC spend exceeds cap', blocker='QUOTE_SPEND_CAP', outcome_unknown=True)
+        if net < 0:
+            raise BinanceClientError('unsupported audited IOC fee', blocker='FEE_EVIDENCE')
         with self.ledger.transaction():
             for trade in rows:
-                self.apply_fill(intent, trade, preview)
+                self.apply_fill(intent, trade, preview, audited_fees=audit is not None)
             self.ledger.db.execute('UPDATE intents SET reserved=? WHERE id=?', ('0', key))
             self.ledger.update(key, 'RESOLVED', result={**result, 'exchange': order, 'orders': [order],
                 'protected': False, 'protection': 'UNPROTECTED_BUY_AND_HOLD', 'protectionUncertain': False,
@@ -679,7 +693,8 @@ class ExecutionService:
                 'netAcquiredQuantity': str(net), 'effectiveEntry': str(quote_debit/net) if net else None,
                 'buybackBudget': buyhold.budget(self.ledger, intent['strategy']),
                 'remainingStrategyQuote': str(self.ledger.available(intent['strategy'], quote)),
-                'fundsLocation': 'SPOT', 'verifiedAt': int(time.time()*1000)})
+                'fundsLocation': 'SPOT', 'verifiedAt': int(time.time()*1000),
+                **({'ownerAuditId': audit['id'], 'evidence': audit['evidence']} if audit else {})})
         return self.ledger.get(key)
 
     def protection_evidence(self, intent, response, orders):
@@ -764,7 +779,7 @@ class ExecutionService:
                 continue
             self.apply_fill(intent, trade, preview)
 
-    def apply_fill(self, intent: dict, trade: dict, preview: dict, *, paper: bool = False) -> None:
+    def apply_fill(self, intent: dict, trade: dict, preview: dict, *, paper: bool = False, audited_fees: bool = False) -> None:
         strategy, base, quote = intent["strategy"], preview["base"], preview["quote"]
         qty, proceeds, commission = number(trade["qty"]), number(trade["quoteQty"]), number(trade["commission"], zero=True)
         fee_asset = trade["commissionAsset"]
@@ -775,7 +790,7 @@ class ExecutionService:
             buy = trade["isBuyer"]
             bound = number(preview['feeRateBound'], zero=True)
             fee_basis = qty if fee_asset == base else proceeds
-            if commission and fee_asset in (base, quote) and commission > fee_basis * bound:
+            if not audited_fees and commission and fee_asset in (base, quote) and commission > fee_basis * bound:
                 raise BinanceClientError('charged commission exceeds verified bound; owner accounting required', blocker='FEE_RATE_CHANGED', outcome_unknown=True)
             fee_quote = commission if fee_asset == quote else commission * number(trade["price"]) if fee_asset == base else Decimal(0)
             if commission and fee_asset not in (base, quote):
@@ -797,8 +812,9 @@ class ExecutionService:
                 net = proceeds - (commission if fee_asset == quote else 0)
                 pnl = net - cost
                 self.ledger.change(strategy, base, "SPOT", -sold, -cost)
-                # Consume attributed hold inventory first: never exempt unrelated protected holdings.
-                buyhold.change(self.ledger, strategy, base, 'SPOT', -min(sold, buyhold.quantity(self.ledger, strategy, base)))
+                current = self.ledger.get(intent['id'])
+                if current['asset'] == base:
+                    buyhold.consume(self.ledger, current, sold)
                 self.ledger.change(strategy, quote, "SPOT", net)
                 self.ledger.event(key + ":pnl", strategy, "realized", quote, net, pnl)
                 if pnl > 0 and not self.ledger.strategy(strategy)["reinvest"]:
@@ -858,7 +874,8 @@ class ExecutionService:
                 cost = Decimal(row['cost']) * amount / balance
                 self.ledger.change(intent["strategy"], intent["asset"], intent["location"], -amount, -cost)
                 self.ledger.change(intent["strategy"], intent["asset"], destination, amount, cost)
-                buyhold.move(self.ledger, intent['strategy'], intent['asset'], intent['location'], destination, amount)
+                buyhold.move(self.ledger, intent['strategy'], intent['asset'], intent['location'], destination, amount,
+                             intent_id=intent['id'], exact=preview.get('acquiredAsset', False))
             self.ledger.update(intent["id"], "RESOLVED", result={**result, "verifiedDestination": destination, "fundsLocation": destination})
 
     async def verify_earn_history(self, intent: dict, op: str, product_id: str, record_id) -> None:
@@ -1078,11 +1095,16 @@ class ExecutionService:
                         step = number(lot["stepSize"])
                     verified = result.get('verifiedAt', 0)
                     if result.get("protected") and not result.get("protectionUncertain") and 0 <= int(time.time()*1000) - verified <= 90000:
-                        covered += number(intent["reserved"], zero=True)
+                        # Hold units already count as intentionally unprotected inventory.
+                        # Only the disjoint reserved non-hold subset adds stop coverage.
+                        attributed = buyhold.reserved(self.ledger, intent['id'])
+                        if attributed > number(intent['reserved'], zero=True):
+                            raise BinanceClientError('protected reservation attribution inconsistent', blocker='OWNERSHIP_DEFICIT')
+                        covered += number(intent['reserved'], zero=True) - attributed
                 if step is None:
                     info = await self.symbol(row["asset"] + strategy["quote"])
                     step = number(next(f for f in info["filters"] if f["filterType"] == "LOT_SIZE")["stepSize"])
-                covered = max(covered, held)
+                covered += held
                 if Decimal(row["quantity"]) - covered >= step:
                     self.ledger.pause("unprotected owned quantity for " + strategy["id"] + ":" + row["asset"])
                     from .incidents import record

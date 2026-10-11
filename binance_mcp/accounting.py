@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 from decimal import Decimal
 from pathlib import Path
 
@@ -51,6 +52,36 @@ def apply_audit(ledger: Ledger, audit: dict, observed_totals: dict[str, str]) ->
         if any(candidate.get(a, Decimal(0)) != number(observed_totals.get(a, "0"), zero=True)
                for a in set(candidate) | set(observed_totals)):
             raise BinanceClientError("audit does not explain complete observed account totals")
+        recoveries = audit.get('iocRecoveries', [])
+        if recoveries:
+            if audit.get('adjustments') or audit.get('resolveIntents'):
+                raise BinanceClientError('IOC recovery must be a standalone exact-fill audit', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
+            svc = ExecutionService(None, ledger, [])
+            recovered_ids = set()
+            for recovery in recoveries:
+                intent = ledger.get(recovery['intentId'])
+                if (intent is None or intent['payload'].get('operation') != 'buy_ioc'
+                        or intent['state'] not in ('PREPARED', 'OUTCOME_UNKNOWN', 'OPEN')
+                        or intent['id'] in recovered_ids or recovery.get('approveActualFees') is not True
+                        or not 0 <= int(time.time()*1000) - recovery.get('observedAt', 0) <= 90000):
+                    raise BinanceClientError('fresh intent-bound IOC recovery evidence required', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
+                svc.resolve_ioc_evidence(intent, recovery['order'], recovery['trades'], recovery['openOrders'], audit=audit)
+                recovered_ids.add(intent['id'])
+            derived = ledger.meta('expectedTotals')
+            if any(Decimal(derived.get(a, '0')) != candidate.get(a, Decimal(0)) for a in set(derived) | set(candidate)):
+                raise BinanceClientError('IOC recovery fills do not explain complete account deltas', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
+        else:
+            for resolution in audit.get('resolveIntents', []):
+                intent = ledger.get(resolution['intentId'])
+                if intent and intent['payload'].get('operation') == 'buy_ioc':
+                    raise BinanceClientError('IOC terminal audit requires exact order/fill recovery evidence', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
+            # Do not separately book an unresolved IOC's balances and later book its fills again.
+            for adjustment in audit.get('adjustments', []):
+                for intent in ledger.outstanding():
+                    preview = (intent['result'] or {}).get('preview', {})
+                    if (intent['payload'].get('operation') == 'buy_ioc' and intent['strategy'] == adjustment['strategyId']
+                            and adjustment['asset'] in (preview.get('base'), preview.get('quote'))):
+                        raise BinanceClientError('unresolved IOC accounting requires exact-fill recovery', blocker='IOC_AUDIT_RECOVERY_REQUIRED')
         for index, adjustment in enumerate(audit.get("adjustments", [])):
             strategy = adjustment["strategyId"]
             cfg = ledger.strategy(strategy)

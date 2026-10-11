@@ -50,6 +50,7 @@ class Ledger:
                 quote_value TEXT NOT NULL, created INTEGER NOT NULL, detail TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS buy_hold(strategy TEXT, asset TEXT, location TEXT, quantity TEXT NOT NULL,
                 PRIMARY KEY(strategy,asset,location));
+            CREATE TABLE IF NOT EXISTS hold_reservations(intent TEXT PRIMARY KEY, quantity TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS incidents(id TEXT PRIMARY KEY, source TEXT NOT NULL,
                 strategy TEXT NOT NULL, state TEXT NOT NULL, created INTEGER NOT NULL, detail TEXT NOT NULL);
@@ -205,6 +206,10 @@ class Ledger:
                     check(self, strategy, prepared['preview'])
             if self.available(strategy, asset, location) < amount_d:
                 raise BinanceClientError("insufficient available strategy capital")
+            from . import buyhold
+            acquired = bool(prepared and prepared.get('preview', {}).get('acquiredAsset'))
+            if acquired or payload.get('operation') in ('order', 'oco', 'legacy_order'):
+                buyhold.reserve(self, key, strategy, asset, location, amount_d, acquired=acquired)
             self.db.execute("INSERT INTO intents VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                             (key, strategy, fingerprint, json.dumps(payload, sort_keys=True), "PREPARED",
                              asset, location, str(amount_d), int(time.time() * 1000), json.dumps(prepared) if prepared is not None else None, None))
