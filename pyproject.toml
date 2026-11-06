@@ -32,3 +32,6 @@ py-modules = ["main"]
 
 [tool.setuptools.packages.find]
 include = ["binance_mcp*"]
+
+[tool.setuptools.package-data]
+binance_mcp = ["*.css"]

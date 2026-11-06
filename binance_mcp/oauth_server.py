@@ -16,16 +16,14 @@ class OAuthManager(_BaseOAuthManager):
         if not isinstance(response, HTMLResponse) or response.status_code >= 400:
             return response
 
-        # The authorize form posts back to this server and then returns a 303 to
-        # the already-validated registered redirect_uri. CSP form-action applies
-        # to that form navigation, including redirects, so the callback origin
-        # must be allowed as well as self.
+        # CSP form-action applies to the form navigation including the final
+        # redirect, so explicitly allow the already-validated callback origin.
         redirect_uri = request.query_params.get("redirect_uri", "")
         parsed = urlparse(redirect_uri)
         if parsed.scheme and parsed.netloc:
             callback_origin = f"{parsed.scheme}://{parsed.netloc}"
             response.headers["Content-Security-Policy"] = (
-                "default-src 'none'; style-src 'unsafe-inline'; "
+                "default-src 'none'; style-src 'self'; "
                 f"form-action 'self' {callback_origin}; frame-ancestors 'none'"
             )
         return response

@@ -1,0 +1,24 @@
+/* Shared by the viewer's React login and the server-rendered OAuth form. */
+.sentinel-auth-page{margin:0;background:#090c12}
+.login-shell{width:100%;height:100%;min-height:100%;min-height:100dvh;display:grid;place-items:center;padding:24px 16px;background:radial-gradient(circle at 50% 15%,#172033,#0b0e14 55%);color:#eaf0f8;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;font-synthesis:none;text-rendering:optimizeLegibility;overflow:auto}
+.login-shell,.login-shell *{box-sizing:border-box}
+.login-card{width:min(440px,100%);min-width:0;background:#111722;border:1px solid #273246;border-radius:18px;padding:28px;box-shadow:0 24px 80px #0008;overflow-wrap:anywhere}
+.login-card h1{margin:0 0 8px;font-size:24px;line-height:1.25}
+.login-card p{margin:12px 0;color:#9ba9bd;line-height:1.45;font-size:14px}
+.login-card strong{color:#eaf0f8}
+.login-card input{width:100%;min-width:0;padding:12px 13px;border-radius:10px;border:1px solid #344057;background:#0a1019;color:#fff;font:inherit;font-size:16px;transition:border-color .12s ease}
+.login-card input::placeholder{color:#748299}
+.login-card input:focus-visible,.login-card button:focus-visible{outline:2px solid #86a6ff;outline-offset:3px}
+.login-field{display:block;margin:16px 0}
+.login-field span{display:block;margin-bottom:6px;font-size:12px;font-weight:700;color:#aebbd0}
+.login-icon{font-size:28px;margin-bottom:6px}
+.login-shell .primary{width:100%;padding:12px 14px;border:1px solid #7897f8;border-radius:8px;background:#7897f8;color:#071020;font:inherit;font-weight:800;cursor:pointer;transition:background .12s ease}
+.login-shell .primary:hover{background:#91abff;border-color:#91abff}
+.login-shell .primary:disabled{opacity:.45;cursor:not-allowed}
+.login-shell .error-box{margin:14px 0 0;padding:10px 12px;border-radius:8px;background:#4b1d2a;color:#ffb5c0;font-size:13px;line-height:1.45}
+.login-access{margin:18px 0;padding:14px;border:1px solid #283449;border-radius:10px;background:#0d131e}
+.login-access h2{margin:0 0 6px;font-size:13px;line-height:1.4;color:#c9d6ed}
+.login-access p{margin:6px 0 0;font-size:12px;line-height:1.5}
+.login-card .login-privacy{margin:16px 0 0;font-size:12px;line-height:1.5}
+@media(max-width:480px){.login-shell{padding:20px 16px}.login-card{padding:24px}.login-card h1{font-size:22px}}
+@media(max-height:600px){.login-shell{align-items:start}}

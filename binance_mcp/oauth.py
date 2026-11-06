@@ -18,13 +18,19 @@ from typing import Any
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
 
 from fastapi import APIRouter, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
+
+from .sentinel_auth import SentinelAuthError, SentinelConfig, authenticate_from_env
 
 SCOPES = {"mcp", "offline_access"}
 AUTH_METHODS = {"none", "client_secret_basic", "client_secret_post"}
 GRANT_TYPES = {"authorization_code", "refresh_token"}
 RESPONSE_TYPES = {"code"}
 CODE_TTL = 300
+SIGNIN_TTL = 600
+SIGNIN_COOKIE = "binance_mcp_authorize"
+LOGIN_CSS = Path(__file__).with_name("sentinel-login.css").read_text(encoding="utf-8")
+LOGIN_CSS_ETAG = '"' + hashlib.sha256(LOGIN_CSS.encode()).hexdigest() + '"'
 MAX_CLIENTS = 256
 PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43}$")
 PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{43,128}$")
@@ -76,26 +82,27 @@ def _scope(raw: str) -> str:
 class OAuthConfig:
     issuer: str
     resource: str
-    owner_token: str
+    state_binding: str
     state_path: str
     access_ttl: int = 3600
     refresh_ttl: int = 30 * 86400
 
+    def __post_init__(self) -> None:
+        if self.access_ttl <= 0 or self.refresh_ttl < self.access_ttl:
+            raise ValueError("OAuth lifetimes require 0 < access TTL <= refresh TTL")
+
     @classmethod
     def from_env(cls) -> "OAuthConfig | None":
-        owner = os.getenv("MCP_OAUTH_OWNER_TOKEN", "").strip()
         public = os.getenv("MCP_PUBLIC_URL", "").strip()
-        if not owner and not public:
+        if not public:
             return None
-        if not owner or not public:
-            raise ValueError("MCP_OAUTH_OWNER_TOKEN and MCP_PUBLIC_URL must be configured together")
-        if len(owner) < 32:
-            raise ValueError("MCP_OAUTH_OWNER_TOKEN must be at least 32 characters")
         issuer = _secure_url(public)
+        sentinel = SentinelConfig.from_env()
+        binding = "sentinel-v1:" + issuer + ":" + ",".join(map(str, sorted(sentinel.allowed_account_ids)))
         return cls(
             issuer=issuer,
             resource=f"{issuer}/mcp/",
-            owner_token=owner,
+            state_binding=binding,
             state_path=os.getenv("MCP_OAUTH_STATE", "/app/data/oauth-state.json"),
             access_ttl=int(os.getenv("MCP_OAUTH_ACCESS_TTL_SECONDS", "3600")),
             refresh_ttl=int(os.getenv("MCP_OAUTH_REFRESH_TTL_SECONDS", str(30 * 86400))),
@@ -111,6 +118,9 @@ class OAuthManager:
         self.codes: dict[str, dict[str, Any]] = {}
         self.access: dict[str, dict[str, Any]] = {}
         self.refresh: dict[str, dict[str, Any]] = {}
+        self.sessions: dict[str, dict[str, Any]] = {}
+        self.spent_refresh: dict[str, dict[str, Any]] = {}
+        self.pending: dict[str, dict[str, Any]] = {}
         self._load()
         self._routes()
 
@@ -120,6 +130,7 @@ class OAuthManager:
         return cls(cfg) if cfg else None
 
     def _routes(self) -> None:
+        self.router.add_api_route("/oauth/login.css", self.login_styles, methods=["GET"], response_model=None)
         self.router.add_api_route("/.well-known/oauth-protected-resource", self.protected_metadata, methods=["GET"], response_model=None)
         self.router.add_api_route("/.well-known/oauth-protected-resource/mcp", self.protected_metadata, methods=["GET"], response_model=None)
         self.router.add_api_route("/.well-known/oauth-protected-resource/mcp/", self.protected_metadata, methods=["GET"], response_model=None)
@@ -128,6 +139,14 @@ class OAuthManager:
         self.router.add_api_route("/oauth/authorize", self.authorize_get, methods=["GET"], response_model=None)
         self.router.add_api_route("/oauth/authorize", self.authorize_post, methods=["POST"], response_model=None)
         self.router.add_api_route("/oauth/token", self.token, methods=["POST"], response_model=None)
+        self.router.add_api_route("/oauth/revoke", self.revoke, methods=["POST"], response_model=None)
+
+    async def login_styles(self, request: Request) -> Response:
+        headers = {"Cache-Control": "public, no-cache", "ETag": LOGIN_CSS_ETAG,
+                   "X-Content-Type-Options": "nosniff"}
+        if request.headers.get("if-none-match") == LOGIN_CSS_ETAG:
+            return Response(status_code=304, headers=headers)
+        return Response(LOGIN_CSS, media_type="text/css", headers=headers)
 
     async def protected_metadata(self) -> JSONResponse:
         return JSONResponse(
@@ -148,6 +167,8 @@ class OAuthManager:
                 "authorization_endpoint": f"{i}/oauth/authorize",
                 "token_endpoint": f"{i}/oauth/token",
                 "registration_endpoint": f"{i}/oauth/register",
+                "revocation_endpoint": f"{i}/oauth/revoke",
+                "revocation_endpoint_auth_methods_supported": sorted(AUTH_METHODS),
                 "response_types_supported": ["code"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "code_challenge_methods_supported": ["S256"],
@@ -271,37 +292,89 @@ class OAuthManager:
             auth = self._parse_auth(values)
         except ValueError as exc:
             return self._error(400, "invalid_request", str(exc))
-        hidden = "".join(
-            f'<input type="hidden" name="{html.escape(k)}" value="{html.escape(v, quote=True)}">'
-            for k, v in auth.items()
-        )
+        binding = request.cookies.get(SIGNIN_COOKIE) or _token()
+        authorization_id = _token()
+        with self._lock:
+            self._cleanup()
+            if len(self.pending) >= MAX_CLIENTS:
+                return self._error(503, "temporarily_unavailable", "sign-in capacity reached")
+            self.pending[_hash(authorization_id)] = {
+                **auth, "binding": _hash(binding), "expires": int(time.time()) + SIGNIN_TTL,
+            }
+        return self._signin_response(auth, authorization_id, binding)
+
+    def _signin_response(self, auth, authorization_id, binding, *, error="", status=200):
+        with self._lock:
+            client_name = self.clients[auth["client_id"]]["name"] or "MCP client"
         action = f"{self.config.issuer}/oauth/authorize"
-        body = f"""<!doctype html><html><head><meta charset='utf-8'><title>Authorize Binance MCP</title></head>
-<body><main><h1>Authorize Binance MCP</h1><p>Approve this MCP client to access the server. Binance API credentials stay server-side and are never issued to the client.</p>
-<form method='post' action='{html.escape(action, quote=True)}'>{hidden}<input type='hidden' name='response_type' value='code'><input type='hidden' name='code_challenge_method' value='S256'><label>Owner approval token <input type='password' name='owner_token' autocomplete='current-password' required></label><button type='submit'>Authorize</button></form></main></body></html>"""
-        return HTMLResponse(
-            body,
+        callback = urlparse(auth["redirect_uri"])
+        callback_origin = f"{callback.scheme}://{callback.netloc}"
+        error_html = f"<div class='error-box' role='alert'>{html.escape(error)}</div>" if error else ""
+        renewal = (f"{self.config.refresh_ttl // 86400} days" if self.config.refresh_ttl % 86400 == 0
+                   else f"{self.config.refresh_ttl} seconds")
+        body = f"""<!doctype html><html lang='en'><head><meta charset='utf-8'>
+<meta name='viewport' content='width=device-width, initial-scale=1'><meta name='theme-color' content='#090c12'>
+<title>Authorize Binance MCP</title><link rel='stylesheet' href='/oauth/login.css'></head>
+<body class='sentinel-auth-page'><main class='login-shell'>
+<form class='login-card' method='post' action='{html.escape(action, quote=True)}' aria-labelledby='login-title'>
+<div class='login-icon' aria-hidden='true'>🛡️</div><h1 id='login-title'>Connect Binance MCP</h1>
+<p>Sign in with your Sentinel account to connect <strong>{html.escape(client_name)}</strong>.</p>
+<section class='login-access' aria-label='Requested access'><h2>Service access</h2>
+<p>Access to this service through its configured tool permissions.</p>
+<p>This connection can renew its access for {renewal} after each renewal. You can revoke it at any time.</p></section>
+<input type='hidden' name='authorization_id' value='{authorization_id}'>
+<label class='login-field'><span>Email</span><input autofocus type='email' name='email' autocomplete='username' placeholder='you@example.com' maxlength='320' required></label>
+<label class='login-field'><span>Password</span><input type='password' name='password' autocomplete='current-password' placeholder='Sentinel password' maxlength='4096' required></label>
+<button class='primary wide' type='submit'>Sign in with Sentinel</button>{error_html}
+<p class='login-privacy'>Your password is verified securely and is never stored by Binance MCP.</p>
+</form></main></body></html>"""
+        response = HTMLResponse(
+            body, status_code=status,
             headers={
                 "Cache-Control": "no-store",
-                "Content-Security-Policy": f"default-src 'none'; style-src 'unsafe-inline'; form-action {action}; frame-ancestors 'none'",
+                "Content-Security-Policy": f"default-src 'none'; style-src 'self'; form-action 'self' {callback_origin}; frame-ancestors 'none'",
                 "X-Frame-Options": "DENY",
-                "Referrer-Policy": "no-referrer",
+                # no-referrer makes browser form POSTs send Origin: null,
+                # which correctly fails the strict origin check below.
+                # Keep the origin for our form action; disclose no referrer
+                # on cross-origin navigation to the connector callback.
+                "Referrer-Policy": "same-origin",
             },
         )
 
+        response.set_cookie(SIGNIN_COOKIE, binding, max_age=SIGNIN_TTL, httponly=True,
+                            secure=self.config.issuer.startswith("https://"), samesite="lax",
+                            path="/oauth/authorize")
+        return response
+
     async def authorize_post(self, request: Request):
-        raw = (await request.body()).decode("utf-8")
-        values = {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
-        owner_token = values.pop("owner_token", "")
+        origin = request.headers.get("origin")
+        parsed = urlparse(self.config.issuer)
+        if ((origin and origin != f"{parsed.scheme}://{parsed.netloc}")
+                or request.headers.get("sec-fetch-site", "same-origin") not in {"same-origin", "none"}):
+            return self._error(403, "access_denied", "cross-origin sign-in rejected")
+        values = await self._form(request)
+        if values is None:
+            return self._error(400, "invalid_request", "invalid form")
+        key = _hash(values.get("authorization_id", ""))
+        binding = _hash(request.cookies.get(SIGNIN_COOKIE, ""))
+        with self._lock:
+            auth = self.pending.get(key)
+            if not auth or auth["expires"] <= time.time() or not _ct(binding, auth["binding"]):
+                return self._error(400, "invalid_request", "sign-in expired; restart connector authorization")
         try:
-            auth = self._parse_auth(values)
-        except ValueError as exc:
-            return self._error(400, "invalid_request", str(exc))
-        if not _ct(owner_token, self.config.owner_token):
-            return self._error(403, "access_denied", "owner approval failed")
+            identity = await authenticate_from_env(values.get("email", ""), values.get("password", ""))
+        except SentinelAuthError as exc:
+            return self._signin_response(auth, values["authorization_id"], request.cookies[SIGNIN_COOKIE],
+                                         error=exc.detail, status=exc.status_code)
         code = _token(32)
         with self._lock:
-            self.codes[_hash(code)] = {**auth, "expires": int(time.time()) + CODE_TTL}
+            if self.pending.pop(key, None) is not auth or auth["expires"] <= time.time():
+                return self._error(400, "invalid_request", "sign-in expired; restart connector authorization")
+            self.codes[_hash(code)] = {
+                **{k: v for k, v in auth.items() if k not in {"binding", "expires"}},
+                "account_id": identity.account_id, "expires": int(time.time()) + CODE_TTL,
+            }
             self._save()
         callback = urlparse(auth["redirect_uri"])
         query = parse_qs(callback.query, keep_blank_values=True)
@@ -311,11 +384,13 @@ class OAuthManager:
             query["state"] = [auth["state"]]
         flattened = [(key, value) for key, values_ in query.items() for value in values_]
         redirect_url = urlunparse(callback._replace(query=urlencode(flattened)))
-        return RedirectResponse(redirect_url, status_code=303, headers={"Cache-Control": "no-store"})
+        return RedirectResponse(redirect_url, status_code=303,
+                                headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
 
     async def token(self, request: Request):
-        raw = (await request.body()).decode("utf-8")
-        values = {k: v[-1] for k, v in parse_qs(raw, keep_blank_values=True).items()}
+        values = await self._form(request)
+        if values is None:
+            return self._error(400, "invalid_request", "invalid form")
         client_id, auth_error = self._authenticate_client(request, values)
         if auth_error:
             response = self._error(401, "invalid_client", auth_error)
@@ -327,6 +402,56 @@ class OAuthManager:
         if grant == "refresh_token":
             return self._exchange_refresh(values, client_id)
         return self._error(400, "unsupported_grant_type", "unsupported grant_type")
+
+    @staticmethod
+    async def _form(request: Request) -> dict[str, str] | None:
+        raw = await request.body()
+        if len(raw) > 16384:
+            return None
+        try:
+            values = parse_qs(raw.decode("utf-8"), keep_blank_values=True, max_num_fields=32)
+        except (ValueError, UnicodeDecodeError):
+            return None
+        if any(len(v) != 1 for v in values.values()):
+            return None
+        return {k: v[0] for k, v in values.items()}
+
+    async def revoke(self, request: Request):
+        values = await self._form(request)
+        if values is None:
+            return self._error(400, "invalid_request", "invalid form")
+        client_id, error = self._authenticate_client(request, values)
+        if error:
+            return self._error(401, "invalid_client", error)
+        if not values.get("token"):
+            return self._error(400, "invalid_request", "token is required")
+        key = _hash(values["token"])
+        with self._lock:
+            record = self.refresh.get(key) or self.access.get(key) or self.spent_refresh.get(key)
+            if record and record["client_id"] == client_id:
+                self._revoke_session(record.get("session_id"))
+                self._save()
+        return JSONResponse({}, headers={"Cache-Control": "no-store"})
+
+    def _revoke_session(self, session_id: str | None) -> None:
+        if session_id:
+            self.sessions.pop(session_id, None)
+            for records in (self.access, self.refresh, self.spent_refresh):
+                for key in [k for k, v in records.items() if v.get("session_id") == session_id]:
+                    del records[key]
+
+    @staticmethod
+    def _account_allowed(account_id: int | None) -> bool:
+        try:
+            return account_id in SentinelConfig.from_env().allowed_account_ids
+        except SentinelAuthError:
+            return False
+
+    def _session_active(self, record: dict[str, Any]) -> bool:
+        session = self.sessions.get(record.get("session_id", ""))
+        return bool(session and session["expires"] > time.time()
+                    and session["client_id"] == record["client_id"]
+                    and self._account_allowed(session["account_id"]))
 
     def _authenticate_client(self, request: Request, values: dict[str, str]) -> tuple[str, str | None]:
         form_id = values.get("client_id", "").strip()
@@ -367,14 +492,14 @@ class OAuthManager:
         code = values.get("code", "").strip()
         redirect_uri = values.get("redirect_uri", "").strip()
         verifier = values.get("code_verifier", "").strip()
-        resource = values.get("resource", "").strip()
-        if not code or not redirect_uri or not verifier or not resource:
-            return self._error(400, "invalid_request", "code, redirect_uri, code_verifier, and resource are required")
+        resource = values.get("resource", "").strip() or self.config.resource
+        if not code or not redirect_uri or not verifier:
+            return self._error(400, "invalid_request", "code, redirect_uri, and code_verifier are required")
         if not PKCE_VERIFIER_RE.fullmatch(verifier):
             return self._error(400, "invalid_grant", "invalid PKCE code_verifier")
         with self._lock:
-            record = self.codes.pop(_hash(code), None)
-            if not record or record["expires"] < time.time():
+            record = self.codes.get(_hash(code))
+            if not record or record["expires"] <= time.time():
                 return self._error(400, "invalid_grant", "authorization code is invalid or expired")
             if client_id != record["client_id"] or redirect_uri != record["redirect_uri"]:
                 return self._error(400, "invalid_grant", "client or redirect mismatch")
@@ -382,7 +507,15 @@ class OAuthManager:
                 return self._error(400, "invalid_grant", "PKCE verification failed")
             if resource != self.config.resource or resource != record["resource"]:
                 return self._error(400, "invalid_target", "resource does not match the authorized MCP server")
-            response = self._issue(record["client_id"], record["scope"])
+            if not self._account_allowed(record.get("account_id")):
+                return self._error(400, "invalid_grant", "authorization is no longer allowed; sign in again")
+            del self.codes[_hash(code)]
+            session_id = _token()
+            self.sessions[session_id] = {
+                "client_id": client_id, "account_id": record["account_id"],
+                "expires": int(time.time()) + self.config.refresh_ttl,
+            }
+            response = self._issue(record["client_id"], record["scope"], session_id)
             self._save()
             return JSONResponse(response, headers={"Cache-Control": "no-store"})
 
@@ -394,35 +527,51 @@ class OAuthManager:
         if resource and resource != self.config.resource:
             return self._error(400, "invalid_target", "resource does not match this MCP server")
         with self._lock:
-            record = self.refresh.pop(_hash(presented), None)
-            if not record or record["expires"] < time.time() or client_id != record["client_id"]:
+            record = self.refresh.get(_hash(presented))
+            if (not record or record["expires"] <= time.time() or client_id != record["client_id"]
+                    or not self._session_active(record)):
                 return self._error(400, "invalid_grant", "refresh token is invalid or expired")
-            scope = _scope(values.get("scope", record["scope"]))
+            try:
+                scope = _scope(values.get("scope", record["scope"]))
+            except ValueError:
+                return self._error(400, "invalid_scope", "unsupported scope")
             if not set(scope.split()).issubset(set(record["scope"].split())):
                 return self._error(400, "invalid_scope", "requested scope exceeds original grant")
-            response = self._issue(record["client_id"], scope)
+            # Validate every parameter before consuming a rotating refresh token.
+            del self.refresh[_hash(presented)]
+            self.spent_refresh[_hash(presented)] = record
+            session_id = record["session_id"]
+            self.sessions[session_id]["expires"] = int(time.time()) + self.config.refresh_ttl
+            response = self._issue(record["client_id"], scope, session_id)
             self._save()
             return JSONResponse(response, headers={"Cache-Control": "no-store"})
 
-    def _issue(self, client_id: str, scope: str) -> dict[str, Any]:
+    def _issue(self, client_id: str, scope: str, session_id: str) -> dict[str, Any]:
         now = int(time.time())
         access = _token(32)
-        refresh = _token(48)
-        self.access[_hash(access)] = {"client_id": client_id, "scope": scope, "expires": now + self.config.access_ttl}
-        self.refresh[_hash(refresh)] = {"client_id": client_id, "scope": scope, "expires": now + self.config.refresh_ttl}
-        return {
+        self._cleanup()
+        self.access[_hash(access)] = {"client_id": client_id, "scope": scope, "expires": now + self.config.access_ttl,
+                                     "session_id": session_id}
+        response = {
             "access_token": access,
             "token_type": "Bearer",
             "expires_in": self.config.access_ttl,
             "scope": scope,
-            "refresh_token": refresh,
         }
+        # OAuth refresh does not require the OIDC offline_access scope. Existing
+        # ChatGPT registrations request mcp alone; retain their renewable access
+        # without adding scopes that the client did not request or the user approve.
+        refresh = _token(48)
+        self.refresh[_hash(refresh)] = {"client_id": client_id, "scope": scope, "expires": now + self.config.refresh_ttl,
+                                       "session_id": session_id}
+        response["refresh_token"] = refresh
+        return response
 
     def _cleanup(self) -> None:
         now = time.time()
-        self.access = {k: v for k, v in self.access.items() if v.get("expires", 0) >= now}
-        self.refresh = {k: v for k, v in self.refresh.items() if v.get("expires", 0) >= now}
-        self.codes = {k: v for k, v in self.codes.items() if v.get("expires", 0) >= now}
+        for records in (self.access, self.refresh, self.codes, self.pending, self.sessions, self.spent_refresh):
+            for key in [k for k, v in records.items() if v.get("expires", 0) <= now]:
+                del records[key]
 
     def valid_access_token(self, token: str) -> bool:
         if not token:
@@ -431,7 +580,7 @@ class OAuthManager:
             record = self.access.get(_hash(token))
             if not record:
                 return False
-            if record["expires"] < time.time():
+            if record["expires"] <= time.time() or not self._session_active(record) or "mcp" not in record["scope"].split():
                 self.access.pop(_hash(token), None)
                 self._save()
                 return False
@@ -464,11 +613,15 @@ class OAuthManager:
             return
         except (OSError, ValueError):
             return
-        if raw.get("owner_fingerprint") != _hash(self.config.owner_token):
-            return
         self.clients = raw.get("clients", {})
+        if raw.get("auth_binding") != _hash(self.config.state_binding):
+            return
         self.access = raw.get("access", {})
         self.refresh = raw.get("refresh", {})
+        self.codes = raw.get("codes", {})
+        self.sessions = raw.get("sessions", {})
+        self.spent_refresh = raw.get("spent_refresh", {})
+        self._cleanup()
 
     def _save(self) -> None:
         path = Path(self.config.state_path)
@@ -478,10 +631,14 @@ class OAuthManager:
         except OSError:
             pass
         state = {
-            "owner_fingerprint": _hash(self.config.owner_token),
+            "version": 3,
+            "auth_binding": _hash(self.config.state_binding),
             "clients": self.clients,
             "access": self.access,
             "refresh": self.refresh,
+            "codes": self.codes,
+            "sessions": self.sessions,
+            "spent_refresh": self.spent_refresh,
         }
         tmp = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
