@@ -19,6 +19,7 @@ from .execution import ExecutionService
 from .ledger import Ledger
 from .monitor import Monitor
 from .investment import InvestmentService, OptionType
+from .account_earn import AccountEarnService
 
 READ_ONLY = ToolAnnotations(read_only_hint=True, idempotent_hint=True, open_world_hint=True)
 WRITE = ToolAnnotations(read_only_hint=False, destructive_hint=False, idempotent_hint=False, open_world_hint=True)
@@ -27,6 +28,7 @@ client = BinanceClient()
 investment = InvestmentService(client)
 ledger = Ledger(os.getenv("BINANCE_LEDGER_PATH", "data/strategy.sqlite"),
                 json.loads(os.getenv("BINANCE_STRATEGIES", "{}")))
+account_earn = AccountEarnService(client, ledger)
 execution = ExecutionService(client, ledger, [s.strip() for s in os.getenv("BINANCE_APPROVED_SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()],
                              incident_receiver_required=receiver_required(),
                              default_strategy_id=os.getenv("BINANCE_DEFAULT_STRATEGY_ID", "").strip() or None)
@@ -35,7 +37,7 @@ server = MCPServer(
     "Binance MCP",
     instructions=(
         "Use binance_public_request for public Binance REST data and binance_account_request for read-only signed account endpoints. "
-        "Every write requires a stable intentId and a provisioned budget. strategyId may be omitted only when an owner-configured default budget exists. Use protected OTOCO for entries, owned OCO for exits, and named investment tools; never request arbitrary signed POSTs. Repeated intents reconcile without re-submitting. "
+        "Strategy writes require a stable intentId and a provisioned budget; account Earn writes use an explicit separate owner-account scope and never spend strategy claims. strategyId may be omitted only when an owner-configured default budget exists. Use protected OTOCO for entries, owned OCO for exits, and named investment tools; never request arbitrary signed POSTs. Repeated intents never re-submit. "
         "Trading is separately deployment-gated. Never request or reveal Binance secrets in chat. Withdrawals are intentionally unsupported."
     ),
 )
@@ -101,6 +103,63 @@ async def binance_order_request(
     if product != "spot":
         raise ValueError("managed allocation supports Spot only; derivatives writes are disabled")
     return await execution.execute(strategyId, intentId, "order" if action == "create" else "cancel", params)
+
+
+@server.tool(
+    title="Preview owner-account Earn transfer or stablecoin swap",
+    description="Read-only exact account balance, strategy-claim exclusion, Earn APR/product guards or Spot IOC price/filter preflight. Does not create an intent or place orders.",
+    annotations=READ_ONLY,
+)
+@rpc_guard
+async def binance_account_earn_preview(
+    operation: Literal["redeem", "subscribe", "swap"],
+    asset: str,
+    amount: str,
+    productId: str | None = None,
+    targetAsset: str | None = None,
+    minimumPrice: str | None = None,
+    minimumApr: str | None = None,
+) -> dict:
+    return await account_earn.preview(operation, asset, amount, product_id=productId,
+                                      target_asset=targetAsset, minimum_price=minimumPrice,
+                                      minimum_apr=minimumApr)
+
+
+@server.tool(
+    title="Execute owner-account Earn transfer or stablecoin swap",
+    description="Account-owned funds only, separate from strategy allocations. Redeem or subscribe an exact Simple Earn Flexible product, or SELL a stablecoin for another via price-floored Spot LIMIT IOC. Requires explicit account-funds acknowledgement, stable intentId, live exchange preflight, policy cap and asset allowlist. Journals before sending and NEVER resubmits uncertain writes. No automatic multi-step conversion.",
+    annotations=WRITE,
+)
+@rpc_guard
+async def binance_account_earn_execute(
+    intentId: str,
+    operation: Literal["redeem", "subscribe", "swap"],
+    asset: str,
+    amount: str,
+    acknowledgeAccountFunds: bool,
+    productId: str | None = None,
+    targetAsset: str | None = None,
+    minimumPrice: str | None = None,
+    minimumApr: str | None = None,
+) -> dict:
+    return await account_earn.execute(
+        intentId, operation, asset, amount, product_id=productId, target_asset=targetAsset,
+        minimum_price=minimumPrice, minimum_apr=minimumApr,
+        acknowledge_account_funds=acknowledgeAccountFunds)
+
+
+@server.tool(title="Owner-account Earn intent status", annotations=READ_ONLY,
+             description="Read persisted owner-account intent and audit evidence; no exchange requests or writes.")
+@rpc_guard
+async def binance_account_earn_status(intentId: str) -> dict:
+    return account_earn.status(intentId)
+
+
+@server.tool(title="Reconcile owner-account Earn intent", annotations=WRITE,
+             description="Verify an existing owner-account Earn receipt or exact IOC order and fills. Does not submit any exchange mutation or retry uncertain writes.")
+@rpc_guard
+async def binance_account_earn_reconcile(intentId: str) -> dict:
+    return await account_earn.reconcile(intentId)
 
 
 @server.tool(
