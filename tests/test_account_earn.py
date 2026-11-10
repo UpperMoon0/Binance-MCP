@@ -153,10 +153,11 @@ async def test_explicit_account_acknowledgement_and_apr_floor(owner_service):
     svc, account, _ = owner_service
     account.free["USDC"] = "600"
     preview = await svc.preview("subscribe", "USDC", "498.451", product_id="USDC001", minimum_apr="0.07")
-    assert preview["contract"]["applicableAdvertisedApr"] == "0.07"
+    assert preview["contract"]["applicableAdvertisedApr"] == "0.09099"
+    assert preview["contract"]["bonusTierApr"] == "0.07"
     assert preview["contract"]["promotionalTier"] == "0-10000USDC"
     with pytest.raises(BinanceClientError, match="APR"):
-        await svc.preview("subscribe", "USDC", "498.451", product_id="USDC001", minimum_apr="0.08")
+        await svc.preview("subscribe", "USDC", "498.451", product_id="USDC001", minimum_apr="0.10")
     with pytest.raises(BinanceClientError, match="acknowledgement"):
         await svc.execute("no-confirm", "subscribe", "USDC", "498.451",
                           product_id="USDC001")

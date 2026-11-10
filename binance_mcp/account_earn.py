@@ -94,7 +94,7 @@ class AccountEarnService:
     @staticmethod
     def _aprs(product: dict, amount: Decimal, existing: Decimal) -> dict:
         base = number(product["latestAnnualPercentageRate"], zero=True)
-        applicable = base
+        bonus = Decimal(0)
         selected = None
         for tier, apr in (product.get("tierAnnualPercentageRate") or {}).items():
             m = re.fullmatch(r"(\d+(?:\.\d+)?)-(\d+(?:\.\d+)?)([A-Z0-9]+)", tier)
@@ -103,9 +103,10 @@ class AccountEarnService:
             lower, upper = Decimal(m.group(1)), Decimal(m.group(2))
             if lower <= existing and existing + amount <= upper:
                 candidate = number(apr, zero=True)
-                if candidate > applicable:
-                    applicable, selected = candidate, tier
-        return {"baseApr": decimal_text(base), "applicableAdvertisedApr": decimal_text(applicable),
+                if candidate > bonus:
+                    bonus, selected = candidate, tier
+        return {"baseApr": decimal_text(base), "bonusTierApr": decimal_text(bonus),
+                "applicableAdvertisedApr": decimal_text(base + bonus),
                 "promotionalTier": selected, "aprVariable": True}
 
     async def preview(self, operation: str, asset: str, amount: str, *, product_id: str | None = None,

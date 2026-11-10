@@ -98,8 +98,9 @@ amount of USD1 on `USD1USDC` using `swap`; verify actual proceeds; finally
 subscribe the verified available USDC into `USDC001`, optionally with
 `minimumApr` to guard the current promotional tier. Each step has its own
 intent ID, live preflight, and observed outcome; no later step is submitted
-when its prerequisite is uncertain. Promotional APRs are variable and
-may have additional account eligibility restrictions.
+when its prerequisite is uncertain. Bonus tier APR is added to the real-time base APR in the preview
+when the full requested amount fits that tier. Both rates are variable,
+and bonus eligibility may have additional account restrictions.
 
 ### Tools
 
