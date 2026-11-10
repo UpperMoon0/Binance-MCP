@@ -48,7 +48,11 @@ def test_schema_passive_reads_and_explicit_reconcile(transport):
     for name in ('binance_execution_status','binance_readiness','binance_fee_compatibility','binance_trade_preview'):
         assert tools[name]['annotations']['readOnlyHint'] is True
     assert tools['binance_execution_reconcile']['annotations']['readOnlyHint'] is False
-    assert len(tools)==19
+    assert len(tools) == 23
+    for name in ("binance_account_earn_preview", "binance_account_earn_status"):
+        assert tools[name]["annotations"]["readOnlyHint"] is True
+    for name in ("binance_account_earn_execute", "binance_account_earn_reconcile"):
+        assert tools[name]["annotations"]["readOnlyHint"] is False
     before=persistent_state(ledger)
     result=call('binance_execution_status',{'intentId':'missing'})
     assert result['isError']

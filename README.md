@@ -52,6 +52,56 @@ These are examples, not automatic allocations. Live allocations must be backed a
 
 Existing accounts must be reconciled before enabling live mode. Keep trading disabled while importing owner-reviewed accounting evidence. Never delete the ledger to recover a timeout or to reset the budget.
 
+### Owner-account Earn transfers and stablecoin swaps
+
+The existing strategy-owned Earn tools deliberately reserve only funds attributed
+to a bounded trading strategy. **They are not the interface for managing the
+account owner's pre-existing Earn portfolio.** Use the separate
+`binance_account_earn_preview`, `binance_account_earn_execute`,
+`binance_account_earn_status` and `binance_account_earn_reconcile` tools.
+
+For `operation=redeem` or `subscribe`, supply `asset`, `productId` and
+`amount`. For `swap`, supply `asset` (the stablecoin sold),
+`targetAsset`, `amount` (source units), and `minimumPrice` (minimum
+quote units per source unit, **before trading commission**). Swap uses an
+exact Spot pair with LIMIT IOC, exchange lot/tick/notional filters, a 0.5%
+maximum observed spread, and a price floor. Partial fill is possible and
+is reported rather than silently completed. Each call to execute also
+requires `acknowledgeAccountFunds=true` and a new stable `intentId`.
+
+Owner-account operations do **not** depend on a provisioned trading-strategy
+allocation, recovery policy, or the strategy monitor. Instead, they verify
+the actual Spot/Earn position and subtract **all live strategy claims**
+at that source location. An operation cannot consume another strategy's
+allocated or profit-reserved capital.
+
+The owner can configure `BINANCE_ACCOUNT_EARN_ASSETS` (default
+`USD1,USDC,USDT,U`) and `BINANCE_ACCOUNT_EARN_MAX_AMOUNT` (default
+`1000` source units per request). `BINANCE_TRADING_ENABLED=true` and
+a trade-enabled Binance signing key are still required. Only the named
+account operations are permitted; arbitrary signed POSTs and withdrawals
+remain disabled.
+
+A separate durable SQLite account-intent journal is written **before**
+every exchange call. The same intent is never automatically retried after
+a timeout, interruption, unknown outcome, or repeated invocation. Another
+account operation is blocked until the previous outcome is verified or
+explicitly rejected. Verify Earn moves against exact Binance history IDs
+and terminal statuses; verify swaps against the generated client order ID
+and actual trade fills. Uncertain outcomes require audit, not a second
+mutation. Changes to the trading strategy's expected account totals are
+recorded for verified owner swaps exactly once.
+
+**Example staged USD1 → USDC rotation:** redeem `USD1001` to Spot;
+verify that Earn redemption, then exchange an explicitly priced integer-lot
+amount of USD1 on `USD1USDC` using `swap`; verify actual proceeds; finally
+subscribe the verified available USDC into `USDC001`, optionally with
+`minimumApr` to guard the current promotional tier. Each step has its own
+intent ID, live preflight, and observed outcome; no later step is submitted
+when its prerequisite is uncertain. Bonus tier APR is added to the real-time base APR in the preview
+when the full requested amount fits that tier. Both rates are variable,
+and bonus eligibility may have additional account restrictions.
+
 ### Tools
 
 | Tool | Purpose |
@@ -68,6 +118,8 @@ Existing accounts must be reconciled before enabling live mode. Keep trading dis
 | `binance_portfolio_snapshot` | Spot, Flexible Earn, DI, open orders, linked lists and reservations with coverage/timestamps |
 | `binance_market_scan` | Closed candles, volume, volatility, spread and optional shortlisted depth |
 | `binance_simple_earn_subscribe` / `binance_simple_earn_redeem` | Allocation-owned Spot-to-Earn transfers and redemptions |
+| `binance_account_earn_preview` / `binance_account_earn_execute` | Account-owner Earn moves and price-guarded stablecoin swaps without spending strategy capital |
+| `binance_account_earn_status` / `binance_account_earn_reconcile` | Auditable account intent journal and exact receipt/fill verification |
 | `binance_dual_investment_subscribe` | Exact-contract DI subscription with live guards |
 | `binance_dual_investment_from_flexible_earn` | Allocation-owned Earn redemption followed by exact DI subscription |
 | `binance_dual_investment_positions` | Normalized page-based DI reads; semantic workflows paginate internally |
