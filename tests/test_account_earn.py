@@ -18,7 +18,7 @@ class FakeAccount:
         self.last_order = None
         self.unknown = False
         self.history_enabled = True
-        self.fee_rate = "0.001"
+        self.fee_rate = "0.00101"
         self.bid, self.ask = "0.9979", "0.998"
         self.swap_failure = None
         self.fills = None
