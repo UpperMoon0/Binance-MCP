@@ -19,6 +19,7 @@ class FakeAccount:
         self.unknown = False
         self.history_enabled = True
         self.fee_rate = "0.00101"
+        self.discount_enabled = False
         self.bid, self.ask = "0.9979", "0.998"
         self.swap_failure = None
         self.fills = None
@@ -60,7 +61,7 @@ class FakeAccount:
             return self.last_order
         if path == "/api/v3/account/commission":
             result = {key: {"maker": "0", "taker": self.fee_rate if key == "standardCommission" else "0", "buyer": "0", "seller": "0"} for key in ("standardCommission", "taxCommission", "specialCommission")}
-            result["discount"] = {"enabledForAccount": False, "enabledForSymbol": False}
+            result["discount"] = {"enabledForAccount": self.discount_enabled, "enabledForSymbol": self.discount_enabled}
             return result
         if path == "/api/v3/myTrades":
             if self.fills is not None:
@@ -353,3 +354,33 @@ async def test_direct_pair_transport_failure_does_not_fallback(owner_service):
     with pytest.raises(BinanceClientError, match="timeout"):
         await svc.preview("swap", "USDT", "913.88", target_asset="USDC", minimum_price="0.998")
     assert not account.orders
+
+
+@pytest.mark.asyncio
+async def test_zero_commission_discount_does_not_block_inverse_pair(owner_service):
+    svc, account, _ = owner_service
+    setup_buy(account)
+    account.discount_enabled = True
+    preview = await svc.preview("swap", "USDT", "913.88", target_asset="USDC", minimum_price="0.998")
+    assert preview["contract"]["feeRateBound"] == "0"
+    account.fee_rate = "0.001"
+    with pytest.raises(BinanceClientError, match="third-asset"):
+        await svc.preview("swap", "USDT", "913.88", target_asset="USDC", minimum_price="0.998")
+
+
+@pytest.mark.asyncio
+async def test_inverse_buy_protects_spot_claims_and_reservations():
+    ledger = Ledger(":memory:", {
+        "main": {"fundingSource": "shared_account", "budgetCap": "100",
+                 "quote": "USDT", "mode": "live", "location": "SPOT", "reinvest": False}
+    })
+    account = FakeAccount()
+    setup_buy(account)
+    svc = AccountEarnService(account, ledger)
+    assert (await svc.preview("swap", "USDT", "813.88", target_asset="USDC",
+                              minimum_price="0.998"))["protectedStrategyFunds"] == "100"
+    with pytest.raises(BinanceClientError, match="outside strategy allocations"):
+        await svc.execute("protected-spot", "swap", "USDT", "813.89", target_asset="USDC",
+                          minimum_price="0.998", acknowledge_account_funds=True)
+    assert account.orders == []
+    assert ledger.balance("main", "USDT", "SPOT") == Decimal("100")
