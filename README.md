@@ -62,11 +62,17 @@ account owner's pre-existing Earn portfolio.** Use the separate
 
 For `operation=redeem` or `subscribe`, supply `asset`, `productId` and
 `amount`. For `swap`, supply `asset` (the stablecoin sold),
-`targetAsset`, `amount` (source units), and `minimumPrice` (minimum
-quote units per source unit, **before trading commission**). Swap uses an
-exact Spot pair with LIMIT IOC, exchange lot/tick/notional filters, a 0.5%
-maximum observed spread, and a price floor. Partial fill is possible and
-is reported rather than silently completed. Each call to execute also
+`targetAsset`, `amount` (maximum source debit, including fee reserve), and
+`minimumPrice` (minimum target units per source unit, **before trading
+commission**). Swap resolves the exact direct SELL pair or, only on an
+authoritative invalid-symbol response, its inverse BUY pair. BUY sizes down
+from the live tick-rounded ask; SELL retains the exact input lot/tick
+validation and reserves conservatively for possible source commissions.
+Both use LIMIT IOC, maker-preserving self-trade prevention, live exchange
+lot/tick/notional and percent-price checks, a 0.5% maximum observed spread,
+and the caller's rate floor. Partial and zero fills are possible; verified
+source debit, unspent source, and net destination proceeds are reported.
+Nonzero third-asset fee modes fail closed. No minimum total fill is promised. Each call to execute also
 requires `acknowledgeAccountFunds=true` and a new stable `intentId`.
 
 Owner-account operations do **not** depend on a provisioned trading-strategy

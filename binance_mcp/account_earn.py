@@ -12,10 +12,12 @@ import json
 import os
 import re
 import time
-from decimal import Decimal
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from typing import Any
 
 from .client import BinanceClientError
+from .execution import ExecutionService, spot_permissions
+from . import fees
 from .investment import InvestmentService
 from .ledger import Ledger, decimal_text, number
 from .snapshots import Snapshots
@@ -109,6 +111,32 @@ class AccountEarnService:
                 "applicableAdvertisedApr": decimal_text(base + bonus),
                 "promotionalTier": selected, "aprVariable": True}
 
+    async def _resolve_pair(self, asset: str, target_asset: str) -> tuple[dict, str]:
+        # Only an authoritative invalid-symbol response permits inverse lookup.
+        # A transport failure or an inactive/mismatched direct pair fails closed.
+        for base, quote, side in ((asset, target_asset, "SELL"), (target_asset, asset, "BUY")):
+            symbol = base + quote
+            cache = getattr(self.client, "_cache", None)
+            if cache is not None:
+                cache.clear()
+            try:
+                info = await self.client.public_get("spot", "/api/v3/exchangeInfo", {"symbol": symbol})
+            except BinanceClientError as exc:
+                if exc.code == -1121 and exc.status == 400 and not exc.outcome_unknown:
+                    continue
+                raise
+            symbols = info.get("symbols") if isinstance(info, dict) else None
+            if not isinstance(symbols, list) or len(symbols) != 1:
+                raise BinanceClientError("exact Spot pair evidence incomplete")
+            pair = symbols[0]
+            if (pair.get("symbol") != symbol or pair.get("status") != "TRADING" or
+                    pair.get("baseAsset") != base or pair.get("quoteAsset") != quote or
+                    pair.get("isSpotTradingAllowed") is not True or
+                    "LIMIT" not in pair.get("orderTypes", [])):
+                raise BinanceClientError("pair is not enabled for Spot trading")
+            return pair, side
+        raise BinanceClientError("neither exact Spot pair is available", blocker="SPOT_PAIR_UNAVAILABLE")
+
     async def preview(self, operation: str, asset: str, amount: str, *, product_id: str | None = None,
                       target_asset: str | None = None, minimum_price: str | None = None,
                       minimum_apr: str | None = None) -> dict:
@@ -165,36 +193,79 @@ class AccountEarnService:
                 raise BinanceClientError("Earn advertised APR below requested minimum", blocker="APR_FLOOR")
         elif operation == "swap":
             price_floor = number(minimum_price)
-            symbol = asset + target_asset
-            info = await self.client.public_get("spot", "/api/v3/exchangeInfo", {"symbol": symbol})
-            symbols = info.get("symbols") if isinstance(info, dict) else None
-            if not isinstance(symbols, list) or len(symbols) != 1:
-                raise BinanceClientError("exact Spot pair unavailable")
-            pair = symbols[0]
-            if (pair.get("symbol") != symbol or pair.get("status") != "TRADING" or
-                    pair.get("baseAsset") != asset or pair.get("quoteAsset") != target_asset or
-                    pair.get("isSpotTradingAllowed") is not True or
-                    "LIMIT" not in pair.get("orderTypes", [])):
-                raise BinanceClientError("pair is not enabled for Spot trading")
+            pair, side = await self._resolve_pair(asset, target_asset)
+            symbol = pair["symbol"]
             filters = {f["filterType"]: f for f in pair["filters"]}
             tick = number(filters["PRICE_FILTER"]["tickSize"])
             step = number(filters["LOT_SIZE"]["stepSize"])
-            if (quantity % step or price_floor % tick or
-                    quantity < number(filters["LOT_SIZE"]["minQty"]) or
-                    quantity > number(filters["LOT_SIZE"]["maxQty"]) or
-                    price_floor < number(filters["PRICE_FILTER"]["minPrice"]) or
-                    price_floor > number(filters["PRICE_FILTER"]["maxPrice"])):
-                raise BinanceClientError("swap price/quantity violates exchange filters", blocker="SPOT_FILTER")
-            notional = filters.get("NOTIONAL") or filters.get("MIN_NOTIONAL")
-            if notional and quantity * price_floor < number(notional["minNotional"]):
-                raise BinanceClientError("swap notional below minimum", blocker="SPOT_FILTER")
-            book = await self.client.public_get("spot", "/api/v3/ticker/bookTicker", {"symbol": symbol})
+            if "EXPIRE_TAKER" not in pair.get("allowedSelfTradePreventionModes", []):
+                raise BinanceClientError("maker-preserving self-trade prevention unavailable", blocker="STP_UNSUPPORTED")
+            account, commission, book = await asyncio.gather(
+                self.client.signed_get("spot", "/api/v3/account"),
+                self.client.signed_get("spot", "/api/v3/account/commission", {"symbol": symbol}),
+                self.client.public_get("spot", "/api/v3/ticker/bookTicker", {"symbol": symbol}),
+            )
+            if not spot_permissions(account, pair):
+                raise BinanceClientError("account lacks Spot permission", blocker="PERMISSIONS")
+            if not isinstance(commission, dict) or commission.get("symbol") not in (None, symbol):
+                raise BinanceClientError("commission symbol contradicts request", blocker="FEE_EVIDENCE")
+            fee_info = fees.inspect(commission)
+            fee_rate = number(fee_info["feeRateBound"], zero=True)
+            if fee_rate and not fee_info["compatible"]:
+                raise BinanceClientError("third-asset commission unsupported", blocker="UNSUPPORTED_FEE_ASSET")
             bid, ask = number(book["bidPrice"]), number(book["askPrice"])
-            if bid < price_floor or (ask - bid) / bid > Decimal("0.005"):
+            if bid > ask or (ask - bid) / bid > Decimal("0.005"):
                 raise BinanceClientError("minimum price or spread guard failed", blocker="SPOT_PRICE_GUARD")
-            contract = {"symbol": symbol, "side": "SELL", "type": "LIMIT", "timeInForce": "IOC",
-                        "price": decimal_text(price_floor), "bookBid": decimal_text(bid),
-                        "bookAsk": decimal_text(ask), "estimatedMinProceeds": decimal_text(quantity * price_floor)}
+            # minimumPrice always means target units per source unit, before fees.
+            # Preserve the existing exact SELL lot/tick contract. The source cap
+            # includes a conservative reserve in case commission is in source.
+            if side == "SELL":
+                if quantity % step or price_floor % tick:
+                    raise BinanceClientError("swap price/quantity violates exchange filters", blocker="SPOT_FILTER")
+                price = price_floor
+                if bid < price:
+                    raise BinanceClientError("minimum price or spread guard failed", blocker="SPOT_PRICE_GUARD")
+                order_qty = (quantity / (1 + fee_rate) / step).to_integral_value(rounding=ROUND_DOWN) * step
+                source_cost = order_qty
+                gross_min = order_qty * price
+            else:
+                # BUY quote price is source/target, the reciprocal of the floor.
+                # Round the live ask UP to its tick but never above the caller's
+                # reciprocal ceiling. Size only against this executable limit.
+                price = (ask / tick).to_integral_value(rounding=ROUND_UP) * tick
+                if price * price_floor > 1:
+                    raise BinanceClientError("minimum price or spread guard failed", blocker="SPOT_PRICE_GUARD")
+                order_qty = (quantity / (price * (1 + fee_rate)) / step).to_integral_value(rounding=ROUND_DOWN) * step
+                source_cost = order_qty * price
+                gross_min = order_qty
+            if order_qty <= 0 or source_cost * (1 + fee_rate) > quantity:
+                raise BinanceClientError("swap quantity exceeds source cap or is below one lot", blocker="SPOT_FILTER")
+            average = Decimal(0)
+            percent_filters = [f for f in pair["filters"] if f["filterType"] in ("PERCENT_PRICE", "PERCENT_PRICE_BY_SIDE")]
+            if percent_filters:
+                avg = await self.client.public_get("spot", "/api/v3/avgPrice", {"symbol": symbol})
+                if any(int(f.get("avgPriceMins", 0)) != int(avg["mins"]) for f in percent_filters):
+                    raise BinanceClientError("percent-price average window unavailable", blocker="SPOT_FILTER")
+                average = number(avg["price"])
+            ExecutionService.validate_leg(pair, order_qty, price, side, average)
+            # Recheck the newer account observation rather than relying only on
+            # the balance read at the beginning of preflight.
+            matches = [b for b in account["balances"] if b.get("asset") == asset]
+            if len(matches) != 1:
+                raise BinanceClientError("Spot source balance evidence incomplete", blocker="ACCOUNT_COVERAGE")
+            available = number(matches[0]["free"], zero=True)
+            protected = self._strategy_claim(asset, location)
+            if available - protected < quantity:
+                raise BinanceClientError("amount exceeds account-owned funds outside strategy allocations",
+                                         blocker="ACCOUNT_UNALLOCATED_FUNDS")
+            contract = {"symbol": symbol, "side": side, "type": "LIMIT", "timeInForce": "IOC",
+                        "selfTradePreventionMode": "EXPIRE_TAKER",
+                        "quantity": decimal_text(order_qty), "price": decimal_text(price),
+                        "bookBid": decimal_text(bid), "bookAsk": decimal_text(ask),
+                        "sourceSpendCap": decimal_text(quantity), "feeRateBound": decimal_text(fee_rate),
+                        "maxSourceDebit": decimal_text(source_cost * (1 + fee_rate)),
+                        "estimatedMinProceeds": decimal_text(gross_min),
+                        "estimatedNetProceedsFloor": decimal_text(gross_min * (1 - fee_rate))}
         return {"observedAt": started, "operation": operation, "asset": asset,
                 "targetAsset": target_asset, "productId": product_id, "amount": decimal_text(quantity),
                 "location": location, "accountAvailable": decimal_text(available),
@@ -237,6 +308,8 @@ class AccountEarnService:
                 if self.ledger.db.execute(
                         "SELECT 1 FROM account_earn_intents WHERE state NOT IN ('RESOLVED','REJECTED')").fetchone():
                     raise BinanceClientError("owner account operation raced with another request")
+                if number(preflight["accountAvailable"], zero=True) - self._strategy_claim(asset, preflight["location"]) < number(amount):
+                    raise BinanceClientError("owner funds changed during preflight", blocker="ACCOUNT_UNALLOCATED_FUNDS")
                 self.ledger.db.execute(
                     "INSERT INTO account_earn_intents VALUES(?,?,?,?,?,?,?,?)",
                     (intent_id, fingerprint, json.dumps(request, sort_keys=True), "PREPARED",
@@ -250,8 +323,9 @@ class AccountEarnService:
                 else:
                     contract = preflight["contract"]
                     response = await self.client.order("spot", "/api/v3/order", "create", {
-                        "symbol": contract["symbol"], "side": "SELL", "type": "LIMIT",
-                        "timeInForce": "IOC", "quantity": request["amount"],
+                        "symbol": contract["symbol"], "side": contract["side"], "type": "LIMIT",
+                        "timeInForce": "IOC", "quantity": contract["quantity"],
+                        "selfTradePreventionMode": contract["selfTradePreventionMode"],
                         "price": contract["price"], "newClientOrderId": _client_id(intent_id)})
                 self._update(intent_id, "OUTCOME_UNKNOWN", response=response)
             except BinanceClientError as exc:
@@ -296,37 +370,61 @@ class AccountEarnService:
             verified = {"recordId": str(identity), "record": matches[0],
                         "destination": "SPOT" if op == "redeem" else "EARN:" + request["productId"]}
         else:
-            symbol = row["preview"]["contract"]["symbol"]
+            contract = row["preview"]["contract"]
+            symbol, side = contract["symbol"], contract["side"]
+            order_qty = number(contract.get("quantity", request["amount"]))
+            limit_price = number(contract["price"])
             order = await self.client.signed_get("spot", "/api/v3/order",
                                                  {"symbol": symbol, "origClientOrderId": _client_id(intent_id)})
             if (order.get("symbol") != symbol or order.get("clientOrderId") != _client_id(intent_id) or
-                    order.get("side") != "SELL" or order.get("type") != "LIMIT" or
+                    order.get("side") != side or order.get("type") != "LIMIT" or
                     order.get("timeInForce") != "IOC" or
-                    number(order.get("origQty", "0")) != amount or
-                    number(order.get("price", "0")) != number(row["preview"]["contract"]["price"])):
+                    number(order.get("origQty", "0")) != order_qty or
+                    number(order.get("price", "0")) != limit_price):
                 raise BinanceClientError("Spot order contradicts owner intent", blocker="ORDER_IDENTITY")
-            if order.get("status") not in ("FILLED", "EXPIRED", "CANCELED", "REJECTED"):
+            if order.get("status") not in ("FILLED", "EXPIRED", "EXPIRED_IN_MATCH", "CANCELED", "REJECTED"):
                 return row
             qty = number(order.get("executedQty", "0"), zero=True)
             quote = number(order.get("cummulativeQuoteQty", "0"), zero=True)
             trades = await self.client.signed_get("spot", "/api/v3/myTrades",
                                                   {"symbol": symbol, "orderId": order["orderId"], "limit": 1000})
             if not isinstance(trades, list) or len(trades) >= 1000 or any(
-                    t.get("orderId") != order["orderId"] or t.get("isBuyer") is not False for t in trades):
+                    t.get("orderId") != order["orderId"] or t.get("isBuyer") is not (side == "BUY") for t in trades):
                 raise BinanceClientError("owner swap fill evidence incomplete", blocker="FILL_COVERAGE")
             if (sum((number(t["qty"]) for t in trades), Decimal(0)) != qty or
                     sum((number(t["quoteQty"]) for t in trades), Decimal(0)) != quote or
                     len({str(t["id"]) for t in trades}) != len(trades)):
                 raise BinanceClientError("Spot fills differ from order", blocker="FILL_COVERAGE")
-            fees: dict[str, Decimal] = {}
+            if qty > order_qty or (order.get("status") == "FILLED" and qty != order_qty):
+                raise BinanceClientError("executed quantity contradicts intent", blocker="FILL_COVERAGE")
+            target = request["targetAsset"]
+            sold, received = (qty, quote) if side == "SELL" else (quote, qty)
+            commissions: dict[str, Decimal] = {}
             for trade in trades:
                 fee_asset = trade["commissionAsset"]
-                fees[fee_asset] = fees.get(fee_asset, Decimal(0)) + number(trade["commission"], zero=True)
+                fee = number(trade["commission"], zero=True)
+                trade_qty, trade_quote = number(trade["qty"]), number(trade["quoteQty"])
+                if ((side == "SELL" and trade_quote < trade_qty * limit_price) or
+                        (side == "BUY" and trade_quote > trade_qty * limit_price)):
+                    raise BinanceClientError("fill violates limit price", blocker="FILL_COVERAGE")
+                if "feeRateBound" in contract and fee:
+                    if fee_asset not in (asset, target):
+                        raise BinanceClientError("third-asset fee requires owner audit", blocker="FEE_EVIDENCE")
+                    basis = (trade_qty if side == "SELL" else trade_quote) if fee_asset == asset else (trade_quote if side == "SELL" else trade_qty)
+                    if fee > basis * number(contract["feeRateBound"], zero=True):
+                        raise BinanceClientError("fee exceeds preflight bound", blocker="FEE_EVIDENCE")
+                commissions[fee_asset] = commissions.get(fee_asset, Decimal(0)) + fee
+            debit = sold + commissions.get(asset, Decimal(0))
+            net = received - commissions.get(target, Decimal(0))
+            if "sourceSpendCap" in contract and (debit > amount or net < 0):
+                raise BinanceClientError("actual swap exceeds source cap or has negative proceeds", blocker="FILL_COVERAGE")
             verified = {"orderId": order["orderId"], "clientOrderId": _client_id(intent_id),
-                        "status": order["status"], "sold": decimal_text(qty),
-                        "grossReceived": decimal_text(quote),
-                        "commissions": {k: decimal_text(v) for k, v in fees.items()},
-                        "netReceived": decimal_text(quote - fees.get(request["targetAsset"], Decimal(0))),
+                        "status": order["status"], "side": side, "sold": decimal_text(sold),
+                        "sourceDebited": decimal_text(debit),
+                        "unspentSource": decimal_text(max(Decimal(0), amount - debit)),
+                        "grossReceived": decimal_text(received),
+                        "commissions": {k: decimal_text(v) for k, v in commissions.items()},
+                        "netReceived": decimal_text(net),
                         "tradeIds": [t["id"] for t in trades]}
         with self.ledger.transaction():
             latest = self.status(intent_id)
