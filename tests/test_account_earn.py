@@ -18,6 +18,11 @@ class FakeAccount:
         self.last_order = None
         self.unknown = False
         self.history_enabled = True
+        self.fee_rate = "0.001"
+        self.bid, self.ask = "0.9979", "0.998"
+        self.swap_failure = None
+        self.fills = None
+        self.fill_status = "EXPIRED"
 
     def _require_trading(self):
         return None
@@ -25,7 +30,7 @@ class FakeAccount:
     async def signed_get(self, _, path, params=None):
         params = params or {}
         if path == "/api/v3/account":
-            return {"balances": [{"asset": asset, "free": value, "locked": "0"}
+            return {"canTrade": True, "permissions": ["SPOT"], "balances": [{"asset": asset, "free": value, "locked": "0"}
                                  for asset, value in self.free.items()]}
         if path == "/sapi/v1/simple-earn/flexible/position":
             rows = []
@@ -53,7 +58,13 @@ class FakeAccount:
         if path == "/api/v3/order":
             assert params["origClientOrderId"] == self.last_order["clientOrderId"]
             return self.last_order
+        if path == "/api/v3/account/commission":
+            result = {key: {"maker": "0", "taker": self.fee_rate if key == "standardCommission" else "0", "buyer": "0", "seller": "0"} for key in ("standardCommission", "taxCommission", "specialCommission")}
+            result["discount"] = {"enabledForAccount": False, "enabledForSymbol": False}
+            return result
         if path == "/api/v3/myTrades":
+            if self.fills is not None:
+                return self.fills
             return [{"id": 101, "orderId": 19, "isBuyer": False,
                      "qty": "500", "quoteQty": "498.95",
                      "commissionAsset": "USDC", "commission": "0.499"}]
@@ -61,9 +72,14 @@ class FakeAccount:
 
     async def public_get(self, _, path, params=None):
         if path == "/api/v3/exchangeInfo":
-            return {"symbols": [{"symbol": "USD1USDC", "baseAsset": "USD1",
-                                 "quoteAsset": "USDC", "status": "TRADING",
+            symbol = params["symbol"]
+            if symbol not in ("USD1USDC", "USDCUSDT"):
+                raise BinanceClientError("invalid symbol", status=400, code=-1121)
+            base, quote = ("USD1", "USDC") if symbol == "USD1USDC" else ("USDC", "USDT")
+            return {"symbols": [{"symbol": symbol, "baseAsset": base,
+                                 "quoteAsset": quote, "status": "TRADING",
                                  "isSpotTradingAllowed": True, "orderTypes": ["LIMIT"],
+                                 "allowedSelfTradePreventionModes": ["EXPIRE_TAKER"],
                                  "filters": [
                                      {"filterType": "PRICE_FILTER", "tickSize": "0.0001",
                                       "minPrice": "0.8", "maxPrice": "1.2"},
@@ -71,7 +87,7 @@ class FakeAccount:
                                       "minQty": "1", "maxQty": "10000000"},
                                      {"filterType": "NOTIONAL", "minNotional": "5"}]}]}
         if path == "/api/v3/ticker/bookTicker":
-            return {"bidPrice": "0.9979", "askPrice": "0.998"}
+            return {"bidPrice": self.bid, "askPrice": self.ask}
         raise AssertionError(path)
 
     async def simple_earn_redeem(self, product_id, amount, dest_account):
@@ -88,11 +104,17 @@ class FakeAccount:
 
     async def order(self, product, path, action, params):
         self.orders.append((product, path, action, params))
+        if self.swap_failure and self.swap_failure.definitive_rejection:
+            raise self.swap_failure
+        executed = sum((Decimal(t["qty"]) for t in self.fills), Decimal(0)) if self.fills is not None else Decimal("500")
+        quote = sum((Decimal(t["quoteQty"]) for t in self.fills), Decimal(0)) if self.fills is not None else Decimal("498.95")
         self.last_order = {"symbol": params["symbol"], "clientOrderId": params["newClientOrderId"],
-                           "orderId": 19, "side": "SELL", "type": "LIMIT",
+                           "orderId": 19, "side": params["side"], "type": "LIMIT",
                            "timeInForce": "IOC", "origQty": params["quantity"],
-                           "price": params["price"], "status": "EXPIRED",
-                           "executedQty": "500", "cummulativeQuoteQty": "498.95"}
+                           "price": params["price"], "status": self.fill_status,
+                           "executedQty": str(executed), "cummulativeQuoteQty": str(quote)}
+        if self.swap_failure:
+            raise self.swap_failure
         return {"orderId": 19, "clientOrderId": params["newClientOrderId"]}
 
 
@@ -208,3 +230,126 @@ async def test_missing_receipt_is_not_assumed_success(owner_service):
     result = await svc.reconcile("account-no-history")
     assert result["state"] == "OUTCOME_UNKNOWN"
     assert len(account.earn_writes) == 1
+
+
+def setup_buy(account, rate="0", fills=None):
+    account.free["USDT"] = "913.88"
+    account.bid, account.ask = "1.0010", "1.0011"
+    account.fee_rate = rate
+    account.fills = fills if fills is not None else [
+        {"id": 201, "orderId": 19, "isBuyer": True, "qty": "912",
+         "quoteQty": "913.0032", "commissionAsset": "USDC", "commission": "0"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_inverse_buy_rounds_down_and_records_exact_source_debit(owner_service):
+    svc, account, ledger = owner_service
+    setup_buy(account)
+    account.fill_status = "FILLED"
+    ledger.set_meta("expectedTotals", {"USDT": "1063.88", "USDC": "0"})
+    preview = await svc.preview("swap", "USDT", "913.88", target_asset="USDC", minimum_price="0.998")
+    contract = preview["contract"]
+    assert contract["symbol"] == "USDCUSDT"
+    assert contract["side"] == "BUY"
+    assert contract["quantity"] == "912"
+    assert Decimal(contract["maxSourceDebit"]) <= Decimal("913.88")
+    result = await svc.execute("inverse-buy", "swap", "USDT", "913.88", target_asset="USDC",
+                               minimum_price="0.998", acknowledge_account_funds=True)
+    assert result["state"] == "RESOLVED"
+    assert account.orders[0][3]["quantity"] == "912"
+    assert account.orders[0][3]["side"] == "BUY"
+    assert account.orders[0][3]["selfTradePreventionMode"] == "EXPIRE_TAKER"
+    verified = result["response"]["verified"]
+    assert Decimal(verified["sourceDebited"]) == Decimal("913.0032")
+    assert Decimal(verified["unspentSource"]) == Decimal("0.8768")
+    assert verified["netReceived"] == "912"
+    assert Decimal(ledger.meta("expectedTotals")["USDT"]) == Decimal("150.8768")
+    assert ledger.balance("main", "USDT", "EARN:USDT001") == Decimal("100")
+    assert (await svc.reconcile("inverse-buy"))["state"] == "RESOLVED"
+    assert len(account.orders) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fee_asset,fee", [("USDT", "0.50055"), ("USDC", "0.5")])
+async def test_inverse_buy_fee_reserve_and_partial_fill(owner_service, fee_asset, fee):
+    svc, account, ledger = owner_service
+    setup_buy(account, "0.001", [{"id": 201, "orderId": 19, "isBuyer": True,
+                                    "qty": "500", "quoteQty": "500.55",
+                                    "commissionAsset": fee_asset, "commission": fee}])
+    ledger.set_meta("expectedTotals", {"USDT": "1063.88", "USDC": "0"})
+    result = await svc.execute("inverse-fees", "swap", "USDT", "913.88", target_asset="USDC",
+                               minimum_price="0.998", acknowledge_account_funds=True)
+    assert result["state"] == "RESOLVED"
+    contract = result["preview"]["contract"]
+    assert contract["quantity"] == "911"
+    assert Decimal(contract["maxSourceDebit"]) <= Decimal("913.88")
+    verified = result["response"]["verified"]
+    expected_debit = Decimal("500.55") + (Decimal(fee) if fee_asset == "USDT" else 0)
+    expected_received = Decimal("500") - (Decimal(fee) if fee_asset == "USDC" else 0)
+    assert Decimal(verified["sourceDebited"]) == expected_debit
+    assert Decimal(verified["netReceived"]) == expected_received
+    assert Decimal(ledger.meta("expectedTotals")["USDT"]) == Decimal("1063.88") - expected_debit
+    assert Decimal(ledger.meta("expectedTotals")["USDC"]) == expected_received
+
+
+@pytest.mark.asyncio
+async def test_inverse_buy_zero_fill(owner_service):
+    svc, account, _ = owner_service
+    setup_buy(account, fills=[])
+    account.fill_status = "EXPIRED_IN_MATCH"
+    result = await svc.execute("zero-fill", "swap", "USDT", "913.88", target_asset="USDC",
+                               minimum_price="0.998", acknowledge_account_funds=True)
+    assert result["state"] == "RESOLVED"
+    assert result["response"]["verified"]["netReceived"] == "0"
+    assert result["response"]["verified"]["unspentSource"] == "913.88"
+
+
+@pytest.mark.asyncio
+async def test_inverse_buy_reject_and_unknown_reconcile(owner_service):
+    svc, account, _ = owner_service
+    setup_buy(account)
+    account.swap_failure = BinanceClientError("rejected", status=400, code=-1013)
+    args = dict(target_asset="USDC", minimum_price="0.998", acknowledge_account_funds=True)
+    assert (await svc.execute("rejected", "swap", "USDT", "913.88", **args))["state"] == "REJECTED"
+    account.swap_failure = BinanceClientError("timeout", outcome_unknown=True)
+    assert (await svc.execute("uncertain-buy", "swap", "USDT", "913.88", **args))["state"] == "OUTCOME_UNKNOWN"
+    assert (await svc.execute("uncertain-buy", "swap", "USDT", "913.88", **args))["state"] == "OUTCOME_UNKNOWN"
+    assert len(account.orders) == 2
+    assert (await svc.reconcile("uncertain-buy"))["state"] == "RESOLVED"
+    assert len(account.orders) == 2
+
+
+@pytest.mark.asyncio
+async def test_inverse_buy_rechecks_price_and_funds_before_submission(owner_service):
+    svc, account, _ = owner_service
+    setup_buy(account)
+    await svc.preview("swap", "USDT", "913.88", target_asset="USDC", minimum_price="0.998")
+    account.bid, account.ask = "1.0030", "1.0031"
+    with pytest.raises(BinanceClientError, match="price or spread"):
+        await svc.execute("deteriorated", "swap", "USDT", "913.88", target_asset="USDC",
+                          minimum_price="0.998", acknowledge_account_funds=True)
+    account.free["USDT"] = "900"
+    with pytest.raises(BinanceClientError, match="outside strategy allocations"):
+        await svc.preview("swap", "USDT", "913.88", target_asset="USDC", minimum_price="0.998")
+    assert not account.orders
+
+
+@pytest.mark.asyncio
+async def test_inverse_buy_below_notional(owner_service):
+    svc, account, _ = owner_service
+    setup_buy(account)
+    with pytest.raises(BinanceClientError, match="notional"):
+        await svc.preview("swap", "USDT", "4", target_asset="USDC", minimum_price="0.998")
+
+
+@pytest.mark.asyncio
+async def test_direct_pair_transport_failure_does_not_fallback(owner_service):
+    svc, account, _ = owner_service
+    setup_buy(account)
+    async def unavailable(*args, **kwargs):
+        raise BinanceClientError("timeout", outcome_unknown=True)
+    account.public_get = unavailable
+    with pytest.raises(BinanceClientError, match="timeout"):
+        await svc.preview("swap", "USDT", "913.88", target_asset="USDC", minimum_price="0.998")
+    assert not account.orders
