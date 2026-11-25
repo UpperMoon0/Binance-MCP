@@ -107,7 +107,7 @@ async def binance_order_request(
 
 @server.tool(
     title="Preview owner-account Earn transfer or stablecoin swap",
-    description="Read-only exact account balance, strategy-claim exclusion, Earn APR/product guards or Spot IOC price/filter preflight. Does not create an intent or place orders.",
+    description="Read-only exact account balance, strategy-claim exclusion, Earn APR/product guards or direct/inverse Spot LIMIT IOC preflight. Swap amount caps source debit including fee reserve; minimumPrice is target units per source unit before fees. Does not create an intent or place orders.",
     annotations=READ_ONLY,
 )
 @rpc_guard
@@ -127,7 +127,7 @@ async def binance_account_earn_preview(
 
 @server.tool(
     title="Execute owner-account Earn transfer or stablecoin swap",
-    description="Account-owned funds only, separate from strategy allocations. Redeem or subscribe an exact Simple Earn Flexible product, or SELL a stablecoin for another via price-floored Spot LIMIT IOC. Requires explicit account-funds acknowledgement, stable intentId, live exchange preflight, policy cap and asset allowlist. Journals before sending and NEVER resubmits uncertain writes. No automatic multi-step conversion.",
+    description="Account-owned funds only, separate from strategy allocations. Redeem or subscribe an exact Simple Earn Flexible product, or convert stablecoins using direct SELL or inverse BUY Spot LIMIT IOC. Swap amount caps source debit including fee reserve; minimumPrice is target units per source unit before fees. Requires explicit account-funds acknowledgement, stable intentId, live exchange preflight, policy cap and asset allowlist. Journals before sending and NEVER resubmits uncertain writes. No automatic multi-step conversion.",
     annotations=WRITE,
 )
 @rpc_guard
